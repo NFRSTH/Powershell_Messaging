@@ -9,7 +9,8 @@ param(
     [int]$RelayObfuscatePort = 0,
     [string]$RegistryAddress = "",
     [int]$RegistryPort = 0,
-    [switch]$ShowCode
+    [switch]$ShowCode,
+    [switch]$DisableSound
 )
 
 $DataDir = Join-Path $env:USERPROFILE ".message_app"
@@ -93,7 +94,7 @@ $MyCode = Get-IDFromIP $MyIP
 $MyPublicKey = Get-Content $PublicKeyFile -Raw
 $MyPublicKeyB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($MyPublicKey))
 $MyECDHPubKey = Get-Content $ECDHPubFile -Raw
-$MyECDHPubKeyB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($MyECDHPubKey))
+$MyECDHPubKeyB64 = $MyECDHPubKey
 
 if ($ShowCode) {
     Write-Host "Your Code: $MyCode" -ForegroundColor Green
@@ -409,88 +410,104 @@ function Send-MessageRaw {
 
 function Send-Message {
     param([string]$TargetCode, [string]$Message)
-    Check-RateLimit
-    $ecdhKey = Get-ECDHKeyForCode $TargetCode
-    $payload = ""
-    $sendPubKeyB64 = ""
-    $usedFS = $false
-    if ($ecdhKey) {
-        $fsResult = Encrypt-FS $TargetCode $Message
-        if ($fsResult) {
-            $payload = "FS|$($fsResult.EphPubKeyB64)|$($fsResult.IVB64)|$($fsResult.CipherB64)|$($fsResult.SignatureB64)"
-            $usedFS = $true
+    $retryCount = 0
+    do {
+        Check-RateLimit
+        $ecdhKey = Get-ECDHKeyForCode $TargetCode
+        $payload = ""
+        $sendPubKeyB64 = ""
+        $usedFS = $false
+        $usedEncryption = $false
+        if ($ecdhKey) {
+            $fsResult = Encrypt-FS $TargetCode $Message
+            if ($fsResult) {
+                $payload = "FS|$($fsResult.EphPubKeyB64)|$($fsResult.IVB64)|$($fsResult.CipherB64)|$($fsResult.SignatureB64)"
+                $usedFS = $true; $usedEncryption = $true
+            }
         }
-    }
-    if (-not $usedFS) {
-        $pubKey = Get-PublicKeyForCode $TargetCode
-        if ($pubKey) {
-            $encResult = Encrypt-For $TargetCode $Message
-            if ($encResult) {
-                $sendPubKeyB64 = ""
-                $payload = "1|$($encResult.EncKeyB64)|$($encResult.IVB64)|$($encResult.CipherB64)"
+        if (-not $usedFS) {
+            $pubKey = Get-PublicKeyForCode $TargetCode
+            if ($pubKey) {
+                $encResult = Encrypt-For $TargetCode $Message
+                if ($encResult) {
+                    $sendPubKeyB64 = ""
+                    $payload = "1|$($encResult.EncKeyB64)|$($encResult.IVB64)|$($encResult.CipherB64)"
+                    $usedEncryption = $true
+                } else {
+                    $sendPubKeyB64 = $MyPublicKeyB64
+                    $sig = Sign-Message $Message
+                    $payload = "0|$Message|$sig"
+                }
             } else {
                 $sendPubKeyB64 = $MyPublicKeyB64
                 $sig = Sign-Message $Message
                 $payload = "0|$Message|$sig"
             }
-        } else {
-            $sendPubKeyB64 = $MyPublicKeyB64
-            $sig = Sign-Message $Message
-            $payload = "0|$Message|$sig"
         }
-    }
-    $ip = Discover-IP $TargetCode
-    if ($ip) {
-        try {
-            $client = New-Object System.Net.Sockets.TcpClient
-            $client.Connect($ip, $ChatPort)
-            $client.ReceiveTimeout = 3000
-            $stream = $client.GetStream()
-            $writer = New-Object System.IO.StreamWriter($stream)
-            $writer.WriteLine("$MyCode|$MyIP|$sendPubKeyB64|$payload")
-            $writer.Flush()
-            $writer.Close()
-            $client.Close()
-            $label = if ($usedFS) { "Sent (P2P, FS)" } else { "Sent (P2P)" }
-            Save-MySentMessage $TargetCode $Message $usedFS
-            return $true, $label
-        } catch { }
-    }
-    if ($script:RelayAddr) {
-        $ok = Relay-Send $TargetCode $sendPubKeyB64 $payload
-        if ($ok) {
-            $label = if ($usedFS) { "Sent (Relay, FS)" } else { "Sent (Relay)" }
-            Save-MySentMessage $TargetCode $Message $usedFS
-            return $true, $label
+        $ip = Discover-IP $TargetCode
+        if ($ip) {
+            try {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect($ip, $ChatPort)
+                $client.ReceiveTimeout = 3000
+                $stream = $client.GetStream()
+                $writer = New-Object System.IO.StreamWriter($stream)
+                $writer.WriteLine("$MyCode|$MyIP|$sendPubKeyB64|$payload")
+                $writer.Flush()
+                $writer.Close()
+                $client.Close()
+                $label = if ($usedFS) { "Sent (P2P, FS)" } else { "Sent (P2P)" }
+                Save-MySentMessage $TargetCode $Message $usedFS -Encrypted $usedEncryption
+                return $true, $label
+            } catch { }
         }
-        return $false, "User offline (relay)"
-    }
-    $regRelay = Find-User $TargetCode
-    if ($regRelay) {
-        $savedAddr = $script:RelayAddr
-        $savedPort = $script:RelayPortNum
-        if ($regRelay -match '^(.+):(\d+)$') {
-            $script:RelayAddr = $matches[1]
-            $script:RelayPortNum = [int]$matches[2]
+        if ($script:RelayAddr) {
             $ok = Relay-Send $TargetCode $sendPubKeyB64 $payload
-            $script:RelayAddr = $savedAddr
-            $script:RelayPortNum = $savedPort
             if ($ok) {
-                $label = if ($usedFS) { "Sent (Dir-Relay, FS)" } else { "Sent (Dir-Relay)" }
-                Save-MySentMessage $TargetCode $Message $usedFS
+                $label = if ($usedFS) { "Sent (Relay, FS)" } else { "Sent (Relay)" }
+                Save-MySentMessage $TargetCode $Message $usedFS -Encrypted $usedEncryption
                 return $true, $label
             }
+            if ($retryCount -eq 0) {
+                Start-Sleep -Milliseconds 500
+                $retryCount++
+                continue
+            }
+            return $false, "User offline (relay)"
         }
-    }
+        $regRelay = Find-User $TargetCode
+        if ($regRelay) {
+            $savedAddr = $script:RelayAddr
+            $savedPort = $script:RelayPortNum
+            if ($regRelay -match '^(.+):(\d+)$') {
+                $script:RelayAddr = $matches[1]
+                $script:RelayPortNum = [int]$matches[2]
+                $ok = Relay-Send $TargetCode $sendPubKeyB64 $payload
+                $script:RelayAddr = $savedAddr
+                $script:RelayPortNum = $savedPort
+                if ($ok) {
+                    $label = if ($usedFS) { "Sent (Dir-Relay, FS)" } else { "Sent (Dir-Relay)" }
+                    Save-MySentMessage $TargetCode $Message $usedFS -Encrypted $usedEncryption
+                    return $true, $label
+                }
+            }
+        }
+        if ($retryCount -eq 0) {
+            Start-Sleep -Milliseconds 500
+            $retryCount++
+            continue
+        }
+        return $false, "User not found"
+    } while ($retryCount -le 1)
     return $false, "User not found"
 }
 
 function Save-MySentMessage {
-    param([string]$TargetCode, [string]$Message, [bool]$FS)
+    param([string]$TargetCode, [string]$Message, [bool]$FS, [bool]$Encrypted = $true)
     $now = Get-Date
     $msgObj = [PSCustomObject]@{
         FromCode = $MyCode; ToCode = $TargetCode; Text = $Message
-        IsEncrypted = $true; IsFS = $FS; IsSent = $true
+        IsEncrypted = $Encrypted; IsFS = $FS; IsSent = $true
         Date = $now.ToString("yyyy-MM-dd"); Time = $now.ToString("HH:mm:ss"); Read = $true
     }
     $inbox = @(Load-Data $InboxFile)
@@ -620,7 +637,7 @@ function Show-History {
     param([string]$TargetCode)
     $inbox = @(Load-Data $InboxFile)
     $msgs = @($inbox | Where-Object {
-        $_.FromCode -eq $TargetCode -or $_.ToCode -eq $TargetCode -or $_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode
+        ($_.FromCode -eq $TargetCode -and $_.ToCode -eq $MyCode) -or ($_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode)
     })
     if ($msgs.Count -eq 0) { return $false }
     $msgs = $msgs | Sort-Object { "$($_.Date) $($_.Time)" }
@@ -637,7 +654,7 @@ function Show-History {
 # ========== TCP LISTENER (background job) ==========
 
 $tcpListenerScript = {
-    param($ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir)
+    param($ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound)
 
     function Load-JData {
         param([string]$Path)
@@ -832,14 +849,14 @@ $tcpListenerScript = {
                             $isFS = $false
                             $isVerified = $false
                             $isFile = $false
+                            $isVoice = $false
                             $isKeyEx = $false
                             $tag = ""
 
                             if ($type -eq "KX" -and $content) {
                                 $isKeyEx = $true
                                 try {
-                                    $ecdhKey = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($content))
-                                    Save-ECDHKey $senderCode $ecdhKey
+                                    Save-ECDHKey $senderCode $content
                                     Write-Host "`n[KEY EX] ECDH key received from $senderCode" -ForegroundColor Green
                                 } catch {}
                             } elseif ($type -eq "FS" -and $content -match '^([A-Za-z0-9+/=]+)\|([A-Za-z0-9+/=]+)\|([A-Za-z0-9+/=]+)\|([A-Za-z0-9+/=]+)$') {
@@ -874,6 +891,7 @@ $tcpListenerScript = {
                                 $voiceTotal = [int]$matches[3]
                                 $voiceIdx = [int]$matches[4]
                                 $voiceB64 = $matches[5]
+                                $isVoice = $true
                                 Receive-VoiceChunk $senderCode $voiceNameB64 $voiceTotal $voiceIdx $voiceB64 $voiceDuration | Out-Null
                                 $displayMsg = "[Voice $($voiceDuration)sec chunk $($voiceIdx+1)/$voiceTotal]"
                                 $tag = "[VN] "
@@ -893,12 +911,13 @@ $tcpListenerScript = {
                                     FromCode = $senderCode; FromIP = $senderIP; Text = $displayMsg
                                     IsEncrypted = $isEncrypted; IsFS = $isFS; IsVerified = $isVerified
                                     Date = $now.ToString("yyyy-MM-dd"); Time = $now.ToString("HH:mm:ss"); Read = $false
-                                    IsGroup = $false; IsSent = $false; IsFile = $isFile
+                                    IsGroup = $false; IsSent = $false; IsFile = $isFile; IsVoice = $isVoice
                                 }
                                 $inbox = @(Load-JData $InboxFile)
                                 $inbox += $msgObj
                                 Save-JData $InboxFile $inbox
                                 if ($displayMsg) {
+                                    if (-not $DisableSound) { [System.Console]::Beep(600, 120) }
                                     Write-Host "`n${tag}$senderCode : $displayMsg" -ForegroundColor Cyan
                                     Write-Host -NoNewline "> " -ForegroundColor Green
                                 }
@@ -1086,13 +1105,13 @@ $relayServerScript = {
                         $toCode = $matches[2]; $pubKey = $matches[3]; $payload = $matches[4]
                         $msgs = @(Load-RData $RelayMsgsFile)
                         if (-not $msgs.ContainsKey($toCode)) { $msgs[$toCode] = @() }
-                        $msgs[$toCode] += @($msgs[$toCode] + @{ From = $matches[1]; PubKey = $pubKey; Payload = $payload; Time = (Get-Date).ToString("o") })
+                        $msgs[$toCode] += @{ From = $matches[1]; PubKey = $pubKey; Payload = $payload; Time = (Get-Date).ToString("o") }
                         Save-RData $RelayMsgsFile $msgs; $resp = "OK"
-                    } elseif ($authenticated -and $line -match '^SENDI\|(.+)\|(.*)\|(.+)$') {
-                        $toInbox = $matches[1]; $pubKey = $matches[2]; $payload = $matches[3]
+                    } elseif ($authenticated -and $line -match '^SENDI\|(.+)\|(.+)\|(.*)\|(.+)$') {
+                        $toInbox = $matches[1]; $fromInbox = $matches[2]; $pubKey = $matches[3]; $payload = $matches[4]
                         $msgs = @(Load-RData $RelayMsgsFile)
                         if (-not $msgs.ContainsKey($toInbox)) { $msgs[$toInbox] = @() }
-                        $msgs[$toInbox] += @($msgs[$toInbox] + @{ From = ""; PubKey = $pubKey; Payload = $payload; Time = (Get-Date).ToString("o") })
+                        $msgs[$toInbox] += @{ From = $fromInbox; PubKey = $pubKey; Payload = $payload; Time = (Get-Date).ToString("o") }
                         Save-RData $RelayMsgsFile $msgs; $resp = "OK"
                     } elseif ($authenticated -and $line -match '^RECV\|(.+)$') {
                         $code = $matches[1]
@@ -1116,7 +1135,7 @@ $relayServerScript = {
 }
 
 Write-Host "Starting services..." -ForegroundColor DarkGray
-$tcpJob = Start-Job -Name "TCPListener" -ScriptBlock $tcpListenerScript -ArgumentList $ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir
+$tcpJob = Start-Job -Name "TCPListener" -ScriptBlock $tcpListenerScript -ArgumentList $ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound
 $udpJob = Start-Job -Name "UDPDiscovery" -ScriptBlock $udpListenerScript -ArgumentList $DiscoveryPort, $MyCode, $MyIP, $MyPublicKeyB64
 
 $script:RelayAddr = ""
@@ -1178,7 +1197,8 @@ function Relay-Send {
         }
         if ($RelayObfuscate -and $RelayPassword) {
             $inboxID = Get-InboxID $ToCode $RelayPassword
-            $cmd += "SENDI|$inboxID|$PubKeyB64|$encodedPayload"
+            $myInboxID = Get-InboxID $MyCode $RelayPassword
+            $cmd += "SENDI|$inboxID|$myInboxID|$PubKeyB64|$encodedPayload"
         } else {
             $cmd += "SEND|$MyCode|$ToCode|$PubKeyB64|$encodedPayload"
         }
@@ -1234,7 +1254,7 @@ function Relay-Recv {
         foreach ($line in $lines) {
             if (-not $line -or $line -eq "NONE") { continue }
             if ($line -eq "AUTH_OK") { continue }
-            if ($line -match '^MSG\|(.+)\|(.*)\|(.+)$') {
+            if ($line -match '^MSG\|(.*)\|(.*)\|(.+)$') {
                 $decodedPayload = try { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($matches[3])) } catch { $matches[3] }
                 $results += [PSCustomObject]@{ From = $matches[1]; PubKey = $matches[2]; Payload = $decodedPayload }
             }
@@ -1279,11 +1299,26 @@ function Discover-IP {
     return $null
 }
 
+function Resolve-InboxID {
+    param([string]$InboxID)
+    if (-not $RelayPassword) { return $null }
+    foreach ($f in $script:Friends) {
+        $fid = Get-InboxID $f.Code $RelayPassword
+        if ($fid -eq $InboxID) { return $f.Code }
+    }
+    return $null
+}
+
 function Push-RelayMessages {
     $msgs = Relay-Recv
     foreach ($m in $msgs) {
         $senderCode = $m.From
         $relayPubKey = $m.PubKey
+
+        if ($senderCode -and -not (Get-PublicKeyForCode $senderCode) -and $RelayPassword) {
+            $resolved = Resolve-InboxID $senderCode
+            if ($resolved) { $senderCode = $resolved }
+        }
 
         if ($relayPubKey) {
             try { Save-PublicKey $senderCode ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($relayPubKey))) } catch {}
@@ -1297,12 +1332,12 @@ function Push-RelayMessages {
         $isEncrypted = $false
         $isFS = $false
         $isVerified = $false
+        $isVoice = $false
         $tag = ""
 
         if ($type -eq "KX") {
             try {
-                $ecdhKey = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($content))
-                Save-ECDHKey $senderCode $ecdhKey
+                Save-ECDHKey $senderCode $content
                 Write-Host "`n[KEY EX] ECDH key from $senderCode" -ForegroundColor Green
             } catch {}
             continue
@@ -1342,6 +1377,7 @@ function Push-RelayMessages {
             $displayMsg = "[File: $fileName chunk $($chunkIndex+1)/$totalChunks]"
             $tag = "[FILE] "
         } elseif ($type -eq "VN" -and $content -match '^(\d+)\|(.+)\|(\d+)\|(\d+)\|(.+)$') {
+            $isVoice = $true
             $voiceDuration = [int]$matches[1]
             $voiceNameB64 = $matches[2]
             $voiceTotal = [int]$matches[3]
@@ -1349,7 +1385,7 @@ function Push-RelayMessages {
             $voiceB64 = $matches[5]
             $vkey = "$senderCode`_voice"
             if (-not $script:VoiceChunkBuffer.ContainsKey($vkey)) {
-                $script:VoiceChunkBuffer[$vkey] = @{ Chunks = @{}; Total = $voiceTotal; Duration = $voiceDuration }
+                $script:VoiceChunkBuffer[$vkey] = @{ Chunks = @{}; Total = $voiceTotal; Duration = $voiceDuration; Received = (Get-Date) }
             }
             $vb = $script:VoiceChunkBuffer[$vkey]
             $vb.Chunks[$voiceIdx] = [Convert]::FromBase64String($voiceB64)
@@ -1388,11 +1424,13 @@ function Push-RelayMessages {
             $msgObj = [PSCustomObject]@{
                 FromCode = $senderCode; FromIP = "(relay)"; Text = $displayMsg
                 IsEncrypted = $isEncrypted; IsFS = $isFS; IsVerified = $isVerified
+                IsVoice = $isVoice
                 Date = $now.ToString("yyyy-MM-dd"); Time = $now.ToString("HH:mm:ss"); Read = $false
             }
             $inbox = @(Load-Data $InboxFile)
             $inbox += $msgObj
             Save-Data $InboxFile $inbox
+            if (-not $DisableSound) { [System.Console]::Beep(600, 120) }
             Write-Host "`n${tag}[Relay] $senderCode : $displayMsg" -ForegroundColor Magenta
             Write-Host -NoNewline "> " -ForegroundColor Green
         }
@@ -1646,7 +1684,7 @@ function Receive-VoiceChunk {
     param([string]$FromCode, [string]$FileNameB64, [int]$TotalChunks, [int]$ChunkIndex, [string]$ChunkB64, [int]$Duration)
     $key = "$FromCode`_voice"
     if (-not $script:VoiceChunkBuffer.ContainsKey($key)) {
-        $script:VoiceChunkBuffer[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration; FileName = $FromCode }
+        $script:VoiceChunkBuffer[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration; FileName = $FromCode; Received = (Get-Date) }
     }
     $vb = $script:VoiceChunkBuffer[$key]
     $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
@@ -1684,6 +1722,18 @@ function Edit-Message {
     $inbox[$Index].Edited = $true
     Save-Data $InboxFile $inbox
     return $true, "Message edited"
+}
+
+function Clear-Chat {
+    param([string]$TargetCode)
+    $inbox = @(Load-Data $InboxFile)
+    $before = $inbox.Count
+    $inbox = @($inbox | Where-Object {
+        -not (($_.FromCode -eq $TargetCode -and $_.ToCode -eq $MyCode) -or ($_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode))
+    })
+    $after = $inbox.Count
+    Save-Data $InboxFile $inbox
+    return $before - $after
 }
 
 function Show-Header {
@@ -1733,6 +1783,7 @@ function Show-MainMenu {
     Write-Host "15. Delete a Message" -ForegroundColor White
     Write-Host "16. Edit a Message" -ForegroundColor White
     Write-Host "17. Send Voice Note" -ForegroundColor White
+    Write-Host "18. Clear Chat" -ForegroundColor White
     Write-Host "0. Exit" -ForegroundColor Red
 }
 
@@ -1795,7 +1846,7 @@ function Chat-Session {
         if ($input -eq "back") { break }
         if ($input -eq "r") {
             $inbox = @(Load-Data $InboxFile)
-            $convo = $inbox | Where-Object { ($_.FromCode -eq $TargetCode -or $_.ToCode -eq $TargetCode) -and ($_.FromCode -eq $MyCode -or $_.ToCode -eq $MyCode -or $_.FromCode -eq $TargetCode) } | Select-Object -Last 10
+            $convo = $inbox | Where-Object { ($_.FromCode -eq $TargetCode -and $_.ToCode -eq $MyCode) -or ($_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode) } | Select-Object -Last 10
             if ($convo) {
                 Write-Host "--- Recent ---" -ForegroundColor DarkGray
                 $convo | ForEach-Object {
@@ -1851,6 +1902,14 @@ function Chat-Session {
     }
 }
 
+function Get-FriendStatus {
+    param([string]$Code)
+    $ip = Discover-IP $Code
+    if ($ip) { return "Online" }
+    if ($script:RelayAddr) { return "Relay" }
+    return "Offline"
+}
+
 function Show-FriendsList {
     if ($script:Friends.Count -eq 0) { Write-Host "`nNo friends in your list." -ForegroundColor Yellow; return }
     Write-Host "`n=== Friends List ===" -ForegroundColor Cyan
@@ -1860,7 +1919,10 @@ function Show-FriendsList {
         if (Get-ECDHKeyForCode $f.Code) { $keyStatus = "[FS+E2E]" }
         elseif (Get-PublicKeyForCode $f.Code) { $keyStatus = "[RSA-E2E]" }
         else { $keyStatus = "[no key]" }
-        Write-Host "[$i] $($f.Name)  |  $($f.Code)  $keyStatus" -ForegroundColor White
+        $status = Get-FriendStatus $f.Code
+        $statusColor = if ($status -eq "Online") { "Green" } elseif ($status -eq "Relay") { "Yellow" } else { "DarkGray" }
+        Write-Host "[$i] $($f.Name)  |  $($f.Code)  $keyStatus  " -NoNewline -ForegroundColor White
+        Write-Host "($status)" -ForegroundColor $statusColor
     }
 }
 
@@ -2040,9 +2102,18 @@ function Show-Downloads {
 
 # ========== MAIN LOOP ==========
 
+function Cleanup-StaleTransfers {
+    $cutoff = (Get-Date).AddMinutes(-5)
+    $staleFileKeys = @($script:PendingFileTransfer.Keys | Where-Object { $script:PendingFileTransfer[$_].Received -lt $cutoff })
+    foreach ($k in $staleFileKeys) { $script:PendingFileTransfer.Remove($k) }
+    $staleVoiceKeys = @($script:VoiceChunkBuffer.Keys | Where-Object { $script:VoiceChunkBuffer[$_].Received -lt $cutoff })
+    foreach ($k in $staleVoiceKeys) { $script:VoiceChunkBuffer.Remove($k) }
+}
+
 try {
     $lastRelayPoll = [DateTime]::MinValue
     $lastNewMsgCheck = [DateTime]::MinValue
+    $lastTransferCleanup = [DateTime]::MinValue
     $script:HasNewMessages = $false
     while ($true) {
         if ($script:RelayAddr -and ([DateTime]::Now - $lastRelayPoll).TotalSeconds -ge 3) {
@@ -2054,6 +2125,11 @@ try {
             $checkInbox = @(Load-Data $InboxFile)
             $script:HasNewMessages = ($checkInbox | Where-Object { -not $_.Read }).Count -gt 0
             $lastNewMsgCheck = [DateTime]::Now
+        }
+
+        if (([DateTime]::Now - $lastTransferCleanup).TotalSeconds -ge 60) {
+            Cleanup-StaleTransfers
+            $lastTransferCleanup = [DateTime]::Now
         }
 
         Show-Header
@@ -2152,6 +2228,18 @@ try {
                     if ($dur -eq "") { $dur = 5 }
                     $ok, $result = Send-VoiceNote -TargetCode $f.Code -Duration ([int]$dur)
                     Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+                } catch { Write-Host "Invalid." -ForegroundColor Red }
+                Read-Host "`nPress Enter"
+            }
+            "18" {
+                if ($script:Friends.Count -eq 0) { Write-Host "No friends." -ForegroundColor Yellow; Read-Host "Press Enter"; continue }
+                Show-FriendsList
+                $fIdx = Read-Host "`nClear chat with friend number (c to cancel)"
+                if ($fIdx -eq "c") { continue }
+                try {
+                    $f = $script:Friends[[int]$fIdx]
+                    $deleted = Clear-Chat -TargetCode $f.Code
+                    Write-Host "Cleared $deleted message(s) with $($f.Name)" -ForegroundColor Green
                 } catch { Write-Host "Invalid." -ForegroundColor Red }
                 Read-Host "`nPress Enter"
             }

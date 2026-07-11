@@ -25,9 +25,17 @@ if ($ShowCode) {
 
 try {
     $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("http://+:$Port/")
-    $listener.Start()
-    Write-Host "Registry server running on http://0.0.0.0:$Port" -ForegroundColor Green
+    try {
+        $listener.Prefixes.Add("http://+:$Port/")
+        $listener.Start()
+        Write-Host "Registry server running on http://0.0.0.0:$Port" -ForegroundColor Green
+    } catch {
+        Write-Host "Could not bind to all interfaces (admin required). Binding to localhost only." -ForegroundColor Yellow
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://localhost:$Port/")
+        $listener.Start()
+        Write-Host "Registry server running on http://localhost:$Port" -ForegroundColor Green
+    }
     Write-Host "Data stored in: $RegistryFile" -ForegroundColor DarkGray
 
     while ($true) {
