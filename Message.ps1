@@ -780,6 +780,26 @@ $tcpListenerScript = {
     }
 
     $script:PendingFileTransfer = @{}
+    $script:VoiceChunks = @{}
+
+    function Receive-VoiceChunk {
+        param([string]$FromCode, [string]$FileNameB64, [int]$TotalChunks, [int]$ChunkIndex, [string]$ChunkB64, [int]$Duration)
+        $key = "$FromCode`_voice"
+        if (-not $script:VoiceChunks.ContainsKey($key)) {
+            $script:VoiceChunks[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration }
+        }
+        $vb = $script:VoiceChunks[$key]
+        $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+        if ($vb.Chunks.Count -eq $TotalChunks) {
+            $allData = New-Object byte[] 0
+            for ($i = 0; $i -lt $TotalChunks; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
+            $script:VoiceChunks.Remove($key)
+            $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "voice_note_$FromCode.wav"
+            try { [System.IO.File]::WriteAllBytes($tempFile, $allData); Write-Host "`n[VOICE] $($vb.Duration)sec from $FromCode saved to $tempFile" -ForegroundColor Magenta } catch {}
+            return $allData
+        }
+        return $null
+    }
 
     try {
         $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $ChatPort)
@@ -848,6 +868,15 @@ $tcpListenerScript = {
                                 Receive-FileChunk $senderCode $fileNameB64 $totalChunks $chunkIndex $chunkB64 $DownloadsDir | Out-Null
                                 $displayMsg = "[File chunk $($chunkIndex+1)/$totalChunks]"
                                 $tag = "[FILE] "
+                            } elseif ($type -eq "VN" -and $content -match '^(\d+)\|(.+)\|(\d+)\|(\d+)\|(.+)$') {
+                                $voiceDuration = [int]$matches[1]
+                                $voiceNameB64 = $matches[2]
+                                $voiceTotal = [int]$matches[3]
+                                $voiceIdx = [int]$matches[4]
+                                $voiceB64 = $matches[5]
+                                Receive-VoiceChunk $senderCode $voiceNameB64 $voiceTotal $voiceIdx $voiceB64 $voiceDuration | Out-Null
+                                $displayMsg = "[Voice $($voiceDuration)sec chunk $($voiceIdx+1)/$voiceTotal]"
+                                $tag = "[VN] "
                             } elseif ($type -eq "0") {
                                 $parts0 = $content -split '\|', 2
                                 $displayMsg = $parts0[0]
@@ -1312,6 +1341,28 @@ function Push-RelayMessages {
             }
             $displayMsg = "[File: $fileName chunk $($chunkIndex+1)/$totalChunks]"
             $tag = "[FILE] "
+        } elseif ($type -eq "VN" -and $content -match '^(\d+)\|(.+)\|(\d+)\|(\d+)\|(.+)$') {
+            $voiceDuration = [int]$matches[1]
+            $voiceNameB64 = $matches[2]
+            $voiceTotal = [int]$matches[3]
+            $voiceIdx = [int]$matches[4]
+            $voiceB64 = $matches[5]
+            $vkey = "$senderCode`_voice"
+            if (-not $script:VoiceChunkBuffer.ContainsKey($vkey)) {
+                $script:VoiceChunkBuffer[$vkey] = @{ Chunks = @{}; Total = $voiceTotal; Duration = $voiceDuration }
+            }
+            $vb = $script:VoiceChunkBuffer[$vkey]
+            $vb.Chunks[$voiceIdx] = [Convert]::FromBase64String($voiceB64)
+            if ($vb.Chunks.Count -eq $voiceTotal) {
+                $allData = New-Object byte[] 0
+                for ($i = 0; $i -lt $voiceTotal; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
+                $script:VoiceChunkBuffer.Remove($vkey)
+                Write-Host "`n[VOICE NOTE] $($vb.Duration)sec from $senderCode. Playing..." -ForegroundColor Magenta
+                $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "voice_relay_$senderCode.wav"
+                try { [System.IO.File]::WriteAllBytes($tempFile, $allData); $player = New-Object System.Media.SoundPlayer($tempFile); $player.PlaySync(); $player.Dispose(); Remove-Item $tempFile -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            $displayMsg = "[Voice $voiceDuration sec chunk $($voiceIdx+1)/$voiceTotal]"
+            $tag = "[VN] "
         } elseif ($type -eq "0") {
             $parts0 = $content -split '\|', 2
             $displayMsg = $parts0[0]
@@ -1367,6 +1418,274 @@ function Decrypt-Message {
     } catch { return $null }
 }
 
+# ========== VOICE RECORDER (C# P/Invoke via winmm.dll) ==========
+
+$script:VoiceRecorderLoaded = $false
+try {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.IO;
+
+public class VoiceRecorder
+{
+    private const int MM_WIM_DATA = 0x3C0;
+    private const int WAVE_FORMAT_PCM = 1;
+    private const int CALLBACK_FUNCTION = 0x30000;
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInOpen(out IntPtr hWaveIn, int uDeviceID, ref WAVEFORMATEX lpFormat, WaveDelegate dwCallback, IntPtr dwInstance, int fdwOpen);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInClose(IntPtr hWaveIn);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInPrepareHeader(IntPtr hWaveIn, ref WAVEHDR lpWaveInHdr, int uSize);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInUnprepareHeader(IntPtr hWaveIn, ref WAVEHDR lpWaveInHdr, int uSize);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInAddBuffer(IntPtr hWaveIn, ref WAVEHDR lpWaveInHdr, int uSize);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInStart(IntPtr hWaveIn);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInStop(IntPtr hWaveIn);
+
+    [DllImport("winmm.dll")]
+    private static extern int waveInGetNumDevs();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WAVEFORMATEX
+    {
+        public ushort wFormatTag;
+        public ushort nChannels;
+        public uint nSamplesPerSec;
+        public uint nAvgBytesPerSec;
+        public ushort nBlockAlign;
+        public ushort wBitsPerSample;
+        public ushort cbSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WAVEHDR
+    {
+        public IntPtr lpData;
+        public uint dwBufferLength;
+        public uint dwBytesRecorded;
+        public IntPtr dwUser;
+        public uint dwFlags;
+        public uint dwLoops;
+        public IntPtr lpNext;
+        public IntPtr reserved;
+    }
+
+    private delegate void WaveDelegate(IntPtr hWaveIn, int uMsg, IntPtr dwInstance, IntPtr dwParam1, IntPtr dwParam2);
+
+    private static IntPtr waveInHandle;
+    private static byte[] recordedBuffer;
+    private static bool recordingComplete;
+    private static object lockObj = new object();
+
+    private static void WaveCallback(IntPtr hWaveIn, int uMsg, IntPtr dwInstance, IntPtr dwParam1, IntPtr dwParam2)
+    {
+        if (uMsg == MM_WIM_DATA)
+        {
+            lock (lockObj) { recordingComplete = true; }
+        }
+    }
+
+    public static int GetDeviceCount() { return waveInGetNumDevs(); }
+
+    public static byte[] Record(int durationSeconds, int sampleRate = 44100, int bitsPerSample = 16, int channels = 1)
+    {
+        if (waveInGetNumDevs() == 0) return null;
+        recordingComplete = false;
+        WAVEFORMATEX fmt = new WAVEFORMATEX();
+        fmt.wFormatTag = WAVE_FORMAT_PCM;
+        fmt.nChannels = (ushort)channels;
+        fmt.nSamplesPerSec = (uint)sampleRate;
+        fmt.wBitsPerSample = (ushort)bitsPerSample;
+        fmt.nBlockAlign = (ushort)(channels * bitsPerSample / 8);
+        fmt.nAvgBytesPerSec = (uint)(sampleRate * channels * bitsPerSample / 8);
+        fmt.cbSize = 0;
+
+        int totalBytes = (int)(sampleRate * channels * (bitsPerSample / 8) * durationSeconds);
+        recordedBuffer = new byte[totalBytes];
+        GCHandle bufHandle = GCHandle.Alloc(recordedBuffer, GCHandleType.Pinned);
+
+        WAVEHDR header = new WAVEHDR();
+        header.lpData = bufHandle.AddrOfPinnedObject();
+        header.dwBufferLength = (uint)totalBytes;
+
+        WaveDelegate callback = new WaveDelegate(WaveCallback);
+        GCHandle cbHandle = GCHandle.Alloc(callback);
+
+        int result = waveInOpen(out waveInHandle, 0, ref fmt, callback, IntPtr.Zero, CALLBACK_FUNCTION);
+        if (result != 0) { bufHandle.Free(); cbHandle.Free(); return null; }
+
+        waveInPrepareHeader(waveInHandle, ref header, System.Runtime.InteropServices.Marshal.SizeOf(header));
+        waveInAddBuffer(waveInHandle, ref header, System.Runtime.InteropServices.Marshal.SizeOf(header));
+        waveInStart(waveInHandle);
+
+        int waited = 0;
+        while (waited < (durationSeconds + 2) * 10)
+        {
+            System.Threading.Thread.Sleep(100);
+            waited++;
+            lock (lockObj) { if (recordingComplete) break; }
+        }
+
+        waveInStop(waveInHandle);
+        waveInUnprepareHeader(waveInHandle, ref header, System.Runtime.InteropServices.Marshal.SizeOf(header));
+        waveInClose(waveInHandle);
+
+        uint bytesRecorded = header.dwBytesRecorded;
+        if (bytesRecorded == 0) bytesRecorded = (uint)totalBytes;
+
+        bufHandle.Free();
+        cbHandle.Free();
+
+        byte[] wavData = BuildWavFile(recordedBuffer, (int)bytesRecorded, sampleRate, bitsPerSample, channels);
+        return wavData;
+    }
+
+    private static byte[] BuildWavFile(byte[] audioData, int dataSize, int sampleRate, int bitsPerSample, int channels)
+    {
+        int byteRate = sampleRate * channels * bitsPerSample / 8;
+        int blockAlign = channels * bitsPerSample / 8;
+        int headerSize = 44;
+        int fileSize = headerSize + dataSize;
+        using (MemoryStream ms = new MemoryStream(fileSize))
+        using (BinaryWriter bw = new BinaryWriter(ms))
+        {
+            bw.Write(new char[] { 'R', 'I', 'F', 'F' });
+            bw.Write(fileSize - 8);
+            bw.Write(new char[] { 'W', 'A', 'V', 'E' });
+            bw.Write(new char[] { 'f', 'm', 't', ' ' });
+            bw.Write(16);
+            bw.Write((short)WAVE_FORMAT_PCM);
+            bw.Write((short)channels);
+            bw.Write(sampleRate);
+            bw.Write(byteRate);
+            bw.Write((short)blockAlign);
+            bw.Write((short)bitsPerSample);
+            bw.Write(new char[] { 'd', 'a', 't', 'a' });
+            bw.Write(dataSize);
+            bw.Write(audioData, 0, dataSize);
+            bw.Flush();
+            return ms.ToArray();
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+    $script:VoiceRecorderLoaded = $true
+    Write-Host "Voice recorder initialized (microphone supported)" -ForegroundColor DarkGray
+} catch { Write-Host "Voice recorder not available (microphone features disabled)" -ForegroundColor DarkGray }
+
+function Record-Audio {
+    param([int]$Duration = 5)
+    if (-not $script:VoiceRecorderLoaded) { return $null }
+    try {
+        $devices = [VoiceRecorder]::GetDeviceCount()
+        if ($devices -eq 0) { Write-Host "No microphone found." -ForegroundColor Red; return $null }
+        Write-Host "Recording for $Duration seconds... (speak now)" -ForegroundColor Yellow
+        $wavBytes = [VoiceRecorder]::Record($Duration)
+        if ($wavBytes -and $wavBytes.Length -gt 44) {
+            $sizeKB = [math]::Round($wavBytes.Length / 1KB, 1)
+            Write-Host "Recording complete ($sizeKB KB)" -ForegroundColor Green
+            return $wavBytes
+        }
+        Write-Host "Recording failed." -ForegroundColor Red
+    } catch { Write-Host "Recording error: $_" -ForegroundColor Red }
+    return $null
+}
+
+function Send-VoiceNote {
+    param([string]$TargetCode, [int]$Duration = 5)
+    $wavBytes = Record-Audio -Duration $Duration
+    if (-not $wavBytes) { return $false, "Recording failed" }
+    try {
+        $fileNameB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("voice.wav"))
+        $totalSize = $wavBytes.Length
+        $maxChunkSize = 250KB
+        $totalChunks = [math]::Ceiling($totalSize / $maxChunkSize)
+        for ($i = 0; $i -lt $totalChunks; $i++) {
+            $offset = $i * $maxChunkSize
+            $chunkSize = [math]::Min($maxChunkSize, $totalSize - $offset)
+            $chunkBytes = $wavBytes[$offset..($offset + $chunkSize - 1)]
+            $chunkB64 = [Convert]::ToBase64String($chunkBytes)
+            $meta = "VN|$Duration|$fileNameB64|$totalChunks|$i|$chunkB64"
+            $ok = Send-MessageRaw -TargetCode $TargetCode -Payload $meta
+            if (-not $ok) { return $false, "Failed at chunk $i/$totalChunks" }
+            $pct = [math]::Round(($i + 1) / $totalChunks * 100)
+            Write-Host "  Sent voice chunk $($i+1)/$totalChunks ($pct%)" -ForegroundColor DarkGray
+            Start-Sleep -Milliseconds 50
+        }
+        return $true, "Voice note sent ($Duration sec, $totalChunks chunks)"
+    } catch { return $false, "Error: $_" }
+}
+
+function Play-VoiceNote {
+    param([byte[]]$WavData)
+    try {
+        $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "voice_note.wav"
+        [System.IO.File]::WriteAllBytes($tempFile, $WavData)
+        $player = New-Object System.Media.SoundPlayer($tempFile)
+        $player.PlaySync()
+        $player.Dispose()
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    } catch { Write-Host "Playback error: $_" -ForegroundColor Red }
+}
+
+$script:VoiceChunkBuffer = @{}
+
+function Receive-VoiceChunk {
+    param([string]$FromCode, [string]$FileNameB64, [int]$TotalChunks, [int]$ChunkIndex, [string]$ChunkB64, [int]$Duration)
+    $key = "$FromCode`_voice"
+    if (-not $script:VoiceChunkBuffer.ContainsKey($key)) {
+        $script:VoiceChunkBuffer[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration; FileName = $FromCode }
+    }
+    $vb = $script:VoiceChunkBuffer[$key]
+    $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+    if ($vb.Chunks.Count -eq $TotalChunks) {
+        $allData = New-Object byte[] 0
+        for ($i = 0; $i -lt $TotalChunks; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
+        $script:VoiceChunkBuffer.Remove($key)
+        Write-Host "`n[VOICE NOTE] $($vb.Duration)sec from $FromCode. Playing..." -ForegroundColor Magenta
+        Play-VoiceNote -WavData $allData
+        return $allData
+    }
+    return $null
+}
+
+# ========== MESSAGE DELETE & EDIT ==========
+
+function Delete-Message {
+    param([int]$Index)
+    $inbox = @(Load-Data $InboxFile)
+    if ($Index -lt 0 -or $Index -ge $inbox.Count) { return $false, "Invalid index" }
+    $msg = $inbox[$Index]
+    if (-not $msg.IsSent -and $msg.FromCode -ne $MyCode) { return $false, "Can only delete your own messages" }
+    $inbox = @($inbox[0..($Index-1)] + $inbox[($Index+1)..($inbox.Count-1)])
+    Save-Data $InboxFile $inbox
+    return $true, "Message deleted"
+}
+
+function Edit-Message {
+    param([int]$Index, [string]$NewText)
+    $inbox = @(Load-Data $InboxFile)
+    if ($Index -lt 0 -or $Index -ge $inbox.Count) { return $false, "Invalid index" }
+    $msg = $inbox[$Index]
+    if (-not $msg.IsSent -and $msg.FromCode -ne $MyCode) { return $false, "Can only edit your own messages" }
+    $inbox[$Index].Text = $NewText
+    $inbox[$Index].Edited = $true
+    Save-Data $InboxFile $inbox
+    return $true, "Message edited"
+}
+
 function Show-Header {
     Clear-Host
     Write-Host "===== Message App v2.0 =====" -ForegroundColor Cyan
@@ -1388,7 +1707,7 @@ function Show-Header {
     }
     if ($RegistryAddress) { Write-Host "Directory: $RegistryAddress" -ForegroundColor DarkYellow }
     Write-Host "[FS: ECDH-P521 + RSA-2048 signing + AES-256]" -ForegroundColor DarkYellow
-    Write-Host "[Rate limit: 10/s | Groups | File sharing | History search]" -ForegroundColor DarkGray
+    Write-Host "[Voice notes | Edit/Delete | Groups | File sharing | Search]" -ForegroundColor DarkGray
     Write-Host "============================" -ForegroundColor Cyan
 }
 
@@ -1411,6 +1730,9 @@ function Show-MainMenu {
     Write-Host "12. Send File" -ForegroundColor White
     Write-Host "13. Search History" -ForegroundColor White
     Write-Host "14. View Downloads" -ForegroundColor White
+    Write-Host "15. Delete a Message" -ForegroundColor White
+    Write-Host "16. Edit a Message" -ForegroundColor White
+    Write-Host "17. Send Voice Note" -ForegroundColor White
     Write-Host "0. Exit" -ForegroundColor Red
 }
 
@@ -1428,11 +1750,27 @@ function Show-Inbox {
         if ($m.IsVerified) { $tag += "[V]" }
         if ($m.IsEncrypted -and -not $m.IsFS) { $tag += "[E]" }
         if ($m.IsGroup) { $tag += "[G]" }
+        if ($m.IsVoice) { $tag += "[VN]" }
+        if ($m.Edited) { $tag += "[ED]" }
         if ($tag) { $tag = "$tag " }
         $newTag = if (-not $m.Read) { " {NEW}" } else { "" }
         $who = if ($m.IsSent -or $m.FromCode -eq $MyCode) { "You -> $($m.ToCode)" } else { $name }
         Write-Host "[$i] [$($m.Date) $($m.Time)] ${tag}$who : $($m.Text)$newTag" -ForegroundColor White
         $inbox[$i].Read = $true
+    }
+    Write-Host "" -ForegroundColor DarkGray
+    $action = Read-Host "d# delete, e# edit, Enter to continue"
+    if ($action -match '^d(\d+)$') {
+        $ok, $result = Delete-Message -Index ([int]$matches[1])
+        Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+        Show-Inbox
+        return
+    } elseif ($action -match '^e(\d+)$') {
+        $newText = Read-Host "New text"
+        $ok, $result = Edit-Message -Index ([int]$matches[1]) -NewText $newText
+        Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+        Show-Inbox
+        return
     }
     Save-Data $InboxFile $inbox
     $script:HasNewMessages = $false
@@ -1450,7 +1788,7 @@ function Chat-Session {
     else { Write-Host "`nChatting with $displayName ($TargetCode) [no key - first msg plaintext + signed]" -ForegroundColor Yellow }
 
     Send-ECDHKeyExchange $TargetCode | Out-Null
-    Write-Host "'r' refresh, 'h' history, 'f' send file, 'back' return" -ForegroundColor DarkGray
+    Write-Host "'r' refresh, 'h' history, 'f' send file, 'v' voice note, 'd' delete msg, 'e' edit msg, 'back' return" -ForegroundColor DarkGray
 
     while ($true) {
         $input = Read-Host "You"
@@ -1466,6 +1804,7 @@ function Chat-Session {
                     if ($_.IsFS) { $t += "[FS]" }
                     if ($_.IsVerified) { $t += "[V]" }
                     if ($_.IsEncrypted -and -not $_.IsFS) { $t += "[E]" }
+                    if ($_.Edited) { $t += "[ED]" }
                     if ($t) { $t = "$t " }
                     Write-Host ("[$($_.Time)] ${t}" + $who + ": $($_.Text)") -ForegroundColor White
                 }
@@ -1482,6 +1821,24 @@ function Chat-Session {
                 $ok, $result = Send-File -TargetCode $TargetCode -FilePath $path
                 Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
             }
+            continue
+        }
+        if ($input -eq "v") {
+            $dur = Read-Host "Duration in seconds (default 5)"
+            if ($dur -eq "") { $dur = 5 }
+            $ok, $result = Send-VoiceNote -TargetCode $TargetCode -Duration ([int]$dur)
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+        if ($input -eq "d") {
+            $idx = Read-Host "Message index to delete"
+            try { $ok, $result = Delete-Message -Index ([int]$idx); Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" }) } catch { Write-Host "Invalid index" -ForegroundColor Red }
+            continue
+        }
+        if ($input -eq "e") {
+            $idx = Read-Host "Message index to edit"
+            $newText = Read-Host "New text"
+            try { $ok, $result = Edit-Message -Index ([int]$idx) -NewText $newText; Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" }) } catch { Write-Host "Invalid" -ForegroundColor Red }
             continue
         }
         if ($input -eq "") { continue }
@@ -1779,6 +2136,25 @@ try {
             }
             "13" { Show-SearchUI }
             "14" { Show-Downloads }
+            "15" {
+                Show-Inbox; Read-Host "`nPress Enter"
+            }
+            "16" {
+                Show-Inbox; Read-Host "`nPress Enter"
+            }
+            "17" {
+                if ($script:Friends.Count -eq 0) { Write-Host "No friends." -ForegroundColor Yellow; Read-Host "Press Enter"; continue }
+                Show-FriendsList
+                $fIdx = Read-Host "`nSend voice note to friend number"
+                try {
+                    $f = $script:Friends[[int]$fIdx]
+                    $dur = Read-Host "Duration in seconds (default 5)"
+                    if ($dur -eq "") { $dur = 5 }
+                    $ok, $result = Send-VoiceNote -TargetCode $f.Code -Duration ([int]$dur)
+                    Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+                } catch { Write-Host "Invalid." -ForegroundColor Red }
+                Read-Host "`nPress Enter"
+            }
             "0" { break }
             default { Write-Host "Invalid." -ForegroundColor Red; Start-Sleep -Seconds 1 }
         }
