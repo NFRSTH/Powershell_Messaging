@@ -46,7 +46,13 @@ function Load-Data {
 
 function Save-Data {
     param([string]$Path, $Data)
-    $Data | ConvertTo-Json -Depth 10 | Set-Content $Path -Force -ErrorAction SilentlyContinue
+    $tempPath = "$Path.tmp"
+    try {
+        $Data | ConvertTo-Json -Depth 10 | Set-Content $tempPath -Force -ErrorAction Stop
+        Move-Item -Path $tempPath -Destination $Path -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $script:RateLimitTimes = @()
@@ -269,6 +275,7 @@ function Decrypt-FS {
     try {
         $sigData = "$EphPubKeyB64|$IVB64|$CipherB64"
         $verified = Verify-Signature $sigData $SignatureB64 $SenderCode
+        if (-not $verified) { return $null }
         $ephPubBlob = [Convert]::FromBase64String($EphPubKeyB64)
         $myPrivB64 = Get-Content $ECDHKeyFile -Raw
         $myPrivBlob = [Convert]::FromBase64String($myPrivB64)
@@ -425,7 +432,7 @@ function Receive-FileChunk {
         }
     }
     $tf = $script:PendingFileTransfer[$key]
-    $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+    if ($ChunkIndex -lt $TotalChunks) { $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64) }
     if ($tf.Chunks.Count -eq $TotalChunks) {
         $allData = New-Object byte[] 0
         for ($i = 0; $i -lt $TotalChunks; $i++) {
@@ -434,7 +441,8 @@ function Receive-FileChunk {
             }
         }
         $safeName = $tf.FileName -replace '[^\w\.\-]', '_'
-        $savePath = Join-Path $DownloadsDir "$($tf.FromCode)_$safeName"
+        $safeCode = $tf.FromCode -replace '[^\w\.\-]', '_'
+        $savePath = Join-Path $DownloadsDir "${safeCode}_$safeName"
         try {
             [System.IO.File]::WriteAllBytes($savePath, $allData)
             $sizeKB = [math]::Round($allData.Length / 1KB, 1)
@@ -753,7 +761,13 @@ $tcpListenerScript = {
 
     function Save-JData {
         param([string]$Path, $Data)
-        $Data | ConvertTo-Json -Depth 10 | Set-Content $Path -Force -ErrorAction SilentlyContinue
+        $tempPath = "$Path.tmp"
+        try {
+            $Data | ConvertTo-Json -Depth 10 | Set-Content $tempPath -Force -ErrorAction Stop
+            Move-Item -Path $tempPath -Destination $Path -Force -ErrorAction Stop
+        } catch {
+            Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+        }
     }
 
     function Get-ImageInfo {
@@ -822,7 +836,7 @@ $tcpListenerScript = {
             $keys = @(Load-JData $KnownKeysFile)
             $entry = $keys | Where-Object { $_.Code -eq $SenderCode }
             if (-not $entry -or -not $entry.PublicKey) { return $false }
-            $pubKey = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($entry.PublicKey))
+            $pubKey = $entry.PublicKey
             $rsa = [System.Security.Cryptography.RSA]::Create()
             $rsa.FromXmlString($pubKey)
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($Data)
@@ -838,6 +852,7 @@ $tcpListenerScript = {
         try {
             $sigData = "$EphPubKeyB64|$IVB64|$CipherB64"
             $verified = Verify-Signature $sigData $SignatureB64 $SenderCode
+            if (-not $verified) { return $null }
             $ephPubBlob = [Convert]::FromBase64String($EphPubKeyB64)
             $myPrivB64 = Get-Content $ECDHKeyFile -Raw
             $myPrivBlob = [Convert]::FromBase64String($myPrivB64)
@@ -874,7 +889,7 @@ $tcpListenerScript = {
             }
         }
         $tf = $script:PendingFileTransfer[$key]
-        $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+        if ($ChunkIndex -lt $TotalChunks) { $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64) }
         if ($tf.Chunks.Count -eq $TotalChunks) {
             $allData = New-Object byte[] 0
             for ($i = 0; $i -lt $TotalChunks; $i++) {
@@ -883,7 +898,8 @@ $tcpListenerScript = {
                 }
             }
             $safeName = $tf.FileName -replace '[^\w\.\-]', '_'
-            $savePath = Join-Path $DownloadsDir "$($tf.FromCode)_$safeName"
+            $safeCode = $tf.FromCode -replace '[^\w\.\-]', '_'
+            $savePath = Join-Path $DownloadsDir "${safeCode}_$safeName"
             try {
                 [System.IO.File]::WriteAllBytes($savePath, $allData)
                 $imgInfo = Get-ImageInfo -FilePath $savePath
@@ -929,6 +945,7 @@ $tcpListenerScript = {
                 $stream = $client.GetStream()
                 $reader = New-Object System.IO.StreamReader($stream)
                 $raw = $reader.ReadLine()
+                $realRemoteIP = $client.Client.RemoteEndPoint.Address.ToString()
                 if ($raw) {
                     $parts = $raw -split '\|', 5
                     if ($parts.Count -ge 4) {
@@ -1046,7 +1063,7 @@ $tcpListenerScript = {
                                 }
                                 try {
                                     $ackClient = New-Object System.Net.Sockets.TcpClient
-                                    $ackClient.Connect($senderIP, $script:ChatPort)
+                                    $ackClient.Connect($realRemoteIP, $script:ChatPort)
                                     $ackStream = $ackClient.GetStream()
                                     $ackWriter = New-Object System.IO.StreamWriter($ackStream)
                                     $ackWriter.WriteLine("$script:MyCode|$senderIP||ACK|$senderCode")
@@ -1205,6 +1222,7 @@ $relayServerScript = {
                 Set-Content $certPath -Value $bytes -Encoding Byte -Force
             }
         } catch { Write-Host "TLS cert generation failed: $_" -ForegroundColor Red }
+        if ($rsaGen) { $rsaGen.Dispose() }
     }
     try {
         $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $RelayPort)
@@ -1398,20 +1416,26 @@ function Relay-Recv {
     } catch { return @() }
 }
 
+$script:IPCacheTTL = 30
+
 function Discover-IP {
     param([string]$TargetCode)
-    if ($script:IPCache.ContainsKey($TargetCode)) { return $script:IPCache[$TargetCode] }
+    if ($script:IPCache.ContainsKey($TargetCode)) {
+        $cached = $script:IPCache[$TargetCode]
+        if ($cached -is [hashtable] -and $cached.Expires -gt (Get-Date)) { return $cached.IP }
+        if ($cached -is [string]) { return $cached }
+    }
     try {
         $udp = New-Object System.Net.Sockets.UdpClient
         $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
         $udp.Client.Bind($localEP)
-        $udp.Client.ReceiveTimeout = 2000
+        $udp.Client.ReceiveTimeout = 1500
         $broadcast = [System.Net.IPAddress]::Broadcast
         $sendEP = New-Object System.Net.IPEndPoint($broadcast, $DiscoveryPort)
         $findMsg = "FIND|$MyCode|$TargetCode"
         $findBytes = [System.Text.Encoding]::UTF8.GetBytes($findMsg)
         $udp.Send($findBytes, $findBytes.Length, $sendEP) | Out-Null
-        $timeout = [DateTime]::Now.AddSeconds(3)
+        $timeout = [DateTime]::Now.AddSeconds(2)
         while ([DateTime]::Now -lt $timeout) {
             try {
                 $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
@@ -1431,6 +1455,7 @@ function Discover-IP {
         }
         $udp.Close()
     } catch {}
+    $script:IPCache[$TargetCode] = @{ IP = $null; Expires = (Get-Date).AddSeconds($script:IPCacheTTL) }
     return $null
 }
 
@@ -1513,12 +1538,13 @@ function Push-RelayMessages {
                 $script:PendingFileTransfer[$key] = @{ FileName = $fileName; FromCode = $senderCode; TotalChunks = $totalChunks; Chunks = @{}; Received = (Get-Date) }
             }
             $tf = $script:PendingFileTransfer[$key]
-            $tf.Chunks[$chunkIndex] = [Convert]::FromBase64String($chunkB64)
+            if ($chunkIndex -lt $totalChunks) { $tf.Chunks[$chunkIndex] = [Convert]::FromBase64String($chunkB64) }
             if ($tf.Chunks.Count -eq $totalChunks) {
                 $allData = New-Object byte[] 0
                 for ($i = 0; $i -lt $totalChunks; $i++) { if ($tf.Chunks.ContainsKey($i)) { $allData = $allData + $tf.Chunks[$i] } }
                 $safeName = $tf.FileName -replace '[^\w\.\-]', '_'
-                $savePath = Join-Path $DownloadsDir "$($tf.FromCode)_$safeName"
+                $safeCode = $tf.FromCode -replace '[^\w\.\-]', '_'
+                $savePath = Join-Path $DownloadsDir "${safeCode}_$safeName"
                 try { [System.IO.File]::WriteAllBytes($savePath, $allData); $imgInfo = Get-ImageInfo -FilePath $savePath; if ($imgInfo) { Write-Host "`n[IMAGE] $($tf.FileName) - $imgInfo" -ForegroundColor Cyan }; Write-Host "`n[FILE] Received: $($tf.FileName) -> $savePath" -ForegroundColor Yellow }
                 catch { Write-Host "`n[FILE ERROR] $_" -ForegroundColor Red }
                 $script:PendingFileTransfer.Remove($key)
@@ -1556,7 +1582,7 @@ function Push-RelayMessages {
                 $keys = @(Load-Data $KnownKeysFile)
                 $entry = $keys | Where-Object { $_.Code -eq $senderCode }
                 if ($entry -and $entry.PublicKey) {
-                    $pubKeyXml = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($entry.PublicKey))
+                    $pubKeyXml = $entry.PublicKey
                     $rsa = [System.Security.Cryptography.RSA]::Create()
                     $rsa.FromXmlString($pubKeyXml)
                     $sig = [Convert]::FromBase64String($parts0[1])
