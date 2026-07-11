@@ -12,3 +12,4 @@ temp_*
 
 # User data (generated at runtime)
 .message_app/
+status.json

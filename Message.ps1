@@ -30,6 +30,47 @@ $SentFilesFile = Join-Path $DataDir "sent_files.json"
 $IdentityFile = Join-Path $DataDir "identity.json"
 $StatusFile = Join-Path $DataDir "status.json"
 
+$script:ReactionEmojis = @(
+    [char]::ConvertFromUtf32(0x1F44D); [char]0x2764; [char]::ConvertFromUtf32(0x1F602)
+    [char]::ConvertFromUtf32(0x1F62E); [char]::ConvertFromUtf32(0x1F389); [char]::ConvertFromUtf32(0x1F525)
+    [char]::ConvertFromUtf32(0x1F4AF); [char]::ConvertFromUtf32(0x1F44F)
+)
+
+$script:EmojiMap = @{
+    "smile"=[char]::ConvertFromUtf32(0x1F604);"joy"=[char]::ConvertFromUtf32(0x1F602);"heart"=[char]0x2764
+    "fire"=[char]::ConvertFromUtf32(0x1F525);"cry"=[char]::ConvertFromUtf32(0x1F622);"laugh"=[char]::ConvertFromUtf32(0x1F606)
+    "wink"=[char]::ConvertFromUtf32(0x1F609);"blush"=[char]::ConvertFromUtf32(0x1F60A);"sunglasses"=[char]::ConvertFromUtf32(0x1F60E)
+    "thumbsup"=[char]::ConvertFromUtf32(0x1F44D);"ok"=[char]::ConvertFromUtf32(0x1F44C);"clap"=[char]::ConvertFromUtf32(0x1F44F)
+    "wave"=[char]::ConvertFromUtf32(0x1F44B);"rocket"=[char]::ConvertFromUtf32(0x1F680);"star"=[char]0x2B50
+    "100"=[char]::ConvertFromUtf32(0x1F4AF);"zap"=[char]0x26A1;"party"=[char]::ConvertFromUtf32(0x1F389)
+    "pray"=[char]::ConvertFromUtf32(0x1F64F);"muscle"=[char]::ConvertFromUtf32(0x1F4AA);"eyes"=[char]::ConvertFromUtf32(0x1F440)
+    "speak"=[char]::ConvertFromUtf32(0x1F4AC);"lock"=[char]::ConvertFromUtf32(0x1F512);"bell"=[char]::ConvertFromUtf32(0x1F514)
+    "warning"=[char]0x26A0;"question"=[char]0x2753;"exclaim"=[char]0x2757;"check"=[char]0x2705;"cross"=[char]0x274C
+    "sun"=[char]0x2600;"moon"=[char]::ConvertFromUtf32(0x1F319);"coffee"=[char]0x2615;"beer"=[char]::ConvertFromUtf32(0x1F37A)
+    "food"=[char]::ConvertFromUtf32(0x1F355);"cat"=[char]::ConvertFromUtf32(0x1F431);"dog"=[char]::ConvertFromUtf32(0x1F436)
+    "poop"=[char]::ConvertFromUtf32(0x1F4A9);"skull"=[char]::ConvertFromUtf32(0x1F480);"alien"=[char]::ConvertFromUtf32(0x1F47D)
+    "robot"=[char]::ConvertFromUtf32(0x1F916);"ghost"=[char]::ConvertFromUtf32(0x1F47B);"metal"=[char]::ConvertFromUtf32(0x1F918)
+    "fist"=[char]0x270A;"peace"=[char]0x270C;"middle"=[char]::ConvertFromUtf32(0x1F595)
+}
+
+function Expand-Emoji {
+    param([string]$Text)
+    $text = $Text
+    foreach ($kv in $script:EmojiMap.GetEnumerator()) { $text = $text -replace ":$($kv.Key):", $kv.Value }
+    return $text
+}
+
+function Format-MessageText {
+    param([string]$Text)
+    $t = $Text
+    $t = $t -replace '\*(.+?)\*', "$([char]0x1B)[1m`$1$([char]0x1B)[0m"
+    $t = $t -replace '_(.+?)_', "$([char]0x1B)[4m`$1$([char]0x1B)[0m"
+    $t = $t -replace '~(.+?)~', "$([char]0x1B)[9m`$1$([char]0x1B)[0m"
+    $t = $t -replace '`(.+?)`', "$([char]0x1B)[93m`$1$([char]0x1B)[0m"
+    $t = $t -replace '(https?://[^\s]+)', "$([char]0x1B)[94m`$1$([char]0x1B)[0m"
+    return $t
+}
+
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 if (-not (Test-Path $DownloadsDir)) { New-Item -ItemType Directory -Path $DownloadsDir -Force | Out-Null }
 
@@ -736,7 +777,9 @@ function Show-History {
         $who = if ($m.FromCode -eq $MyCode -or $m.IsSent) { "You" } else { $m.FromCode }
         $fsTag = if ($m.IsFS) { "[FS] " } else { "" }
         $encTag = if ($m.IsEncrypted -and -not $m.IsFS) { "[E] " } else { "" }
-        Write-Host "[$($m.Date) $($m.Time)] ${encTag}${fsTag}$who : $($m.Text)" -ForegroundColor White
+        $displayText = Format-MessageText -Text $m.Text
+        $rd = Get-ReactionDisplay -Reactions $m.Reactions
+        Write-Host "[$($m.Date) $($m.Time)] ${encTag}${fsTag}$who : $displayText$rd" -ForegroundColor White
     }
     return $true
 }
@@ -1912,6 +1955,74 @@ function Get-PinnedMessages {
     })
 }
 
+function Add-Reaction {
+    param([int]$MsgIndex, [string]$TargetCode, [string]$Emoji)
+    $inbox = @(Load-Data $InboxFile)
+    $idx = $MsgIndex - 1
+    if ($idx -lt 0 -or $idx -ge $inbox.Count) { return }
+    $m = $inbox[$idx]
+    if ($m.FromCode -ne $TargetCode -and $m.ToCode -ne $TargetCode) { return }
+    if (-not $m.Reactions) { $m.Reactions = @{} }
+    $m.Reactions[$MyCode] = $Emoji
+    Save-Data $InboxFile $inbox
+}
+
+function Get-ReactionDisplay {
+    param([object]$Reactions)
+    if (-not $Reactions -or $Reactions.Keys.Count -eq 0) { return "" }
+    $groups = @{}
+    foreach ($em in $Reactions.Values) {
+        if (-not $groups[$em]) { $groups[$em] = 0 }
+        $groups[$em]++
+    }
+    $parts = @()
+    foreach ($kv in $groups.GetEnumerator()) { $parts += "$($kv.Key)x$($kv.Value)" }
+    return "  [$($parts -join ' ')]"
+}
+
+function Forward-Message {
+    param([int]$MsgIndex, [string]$TargetCode, [string]$FromCode)
+    $inbox = @(Load-Data $InboxFile)
+    $idx = $MsgIndex - 1
+    if ($idx -lt 0 -or $idx -ge $inbox.Count) { Write-Host "Invalid index." -ForegroundColor Red; return }
+    $original = $inbox[$idx]
+    $fromInfo = if ($original.FromCode -eq $FromCode) { "me" } else { $original.FromCode }
+    $fwdText = "@$($original.FromCode)[$($original.Date)] $($original.Text)"
+    $msg = @{
+        FromCode=$FromCode; ToCode=$TargetCode
+        Text=$fwdText; Date=Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Read=$false; Pinned=$false; Reactions=@{}
+    }
+    $inbox += $msg
+    Save-Data $InboxFile $inbox
+    Write-Host "Message forwarded." -ForegroundColor Green
+}
+
+function Show-MessageStats {
+    $inbox = @(Load-Data $InboxFile)
+    if ($inbox.Count -eq 0) { Write-Host "No messages." -ForegroundColor Yellow; return }
+    $total = $inbox.Count
+    $fromMe = @($inbox | Where-Object { $_.FromCode -eq $MyCode }).Count
+    $toMe = @($inbox | Where-Object { $_.ToCode -eq $MyCode -and $_.FromCode -ne $MyCode }).Count
+    $unread = @($inbox | Where-Object { -not $_.Read -and $_.ToCode -eq $MyCode }).Count
+    $pinned = @($inbox | Where-Object { $_.Pinned }).Count
+    $forwarded = @($inbox | Where-Object { $_.Text -match '^@' }).Count
+    $words = @()
+    foreach ($m in $inbox) {
+        if ($m.Text) { $words += $m.Text -split '\s+' }
+    }
+    $topWords = @{}
+    foreach ($w in $words) {
+        $clean = $w.ToLower().Trim('.,!?;:''"')
+        if ($clean.Length -ge 4) { if ($topWords.ContainsKey($clean)) { $topWords[$clean]++ } else { $topWords[$clean] = 1 } }
+    }
+    $sorted = $topWords.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+    Write-Host "--- Message Stats ---" -ForegroundColor Cyan
+    Write-Host "  Total: $total | Sent: $fromMe | Received: $toMe"
+    Write-Host "  Unread: $unread | Pinned: $pinned | Forwarded: $forwarded"
+    if ($sorted) { Write-Host "  Top words: $($sorted.Key -join ', ')" }
+}
+
 function Show-Header {
     Clear-Host
     Write-Host "===== Message App v2.0 =====" -ForegroundColor Cyan
@@ -1966,6 +2077,7 @@ function Show-MainMenu {
     Write-Host "18. Clear Chat" -ForegroundColor White
     Write-Host "19. Export Chat History" -ForegroundColor White
     Write-Host "20. Set Your Status" -ForegroundColor White
+    Write-Host "21. Message Stats" -ForegroundColor White
     Write-Host "0. Exit" -ForegroundColor Red
 }
 
@@ -1990,11 +2102,12 @@ function Show-Inbox {
         if ($tag) { $tag = "$tag " }
         $newTag = if (-not $m.Read) { " {NEW}" } else { "" }
         $who = if ($m.IsSent -or $m.FromCode -eq $MyCode) { "You -> $($m.ToCode)" } else { $name }
-        Write-Host "[$i] [$($m.Date) $($m.Time)] ${tag}$who : $($m.Text)$newTag" -ForegroundColor White
+        $reactionDisp = Get-ReactionDisplay -Reactions $m.Reactions
+        Write-Host "[$i] [$($m.Date) $($m.Time)] ${tag}$who : $($m.Text)$newTag$reactionDisp" -ForegroundColor White
         $inbox[$i].Read = $true
     }
     Write-Host "" -ForegroundColor DarkGray
-    Write-Host "d# delete | e# edit | p# pin/unpin" -ForegroundColor DarkGray
+    Write-Host "d# delete | e# edit | p# pin/unpin | r# <emoji> react | f# <code> forward" -ForegroundColor DarkGray
     $action = Read-Host "Action (Enter to continue)"
     if ($action -match '^d(\d+)$') {
         $ok, $result = Delete-Message -Index ([int]$matches[1])
@@ -2010,6 +2123,20 @@ function Show-Inbox {
         $newText = Read-Host "New text"
         $ok, $result = Edit-Message -Index ([int]$matches[1]) -NewText $newText
         Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+        Show-Inbox
+        return
+    } elseif ($action -match '^r(\d+)$') {
+        $emoji = Read-Host "Emoji (or enter # for picker)"
+        if ($emoji -eq '#') {
+            Write-Host "Available: $($ReactionEmojis -join ' ')" -ForegroundColor Cyan
+            $emoji = Read-Host "Pick emoji"
+        }
+        Add-Reaction -MsgIndex ([int]$matches[1]) -TargetCode $MyCode -Emoji $emoji
+        Show-Inbox
+        return
+    } elseif ($action -match '^f(\d+)$') {
+        $tgt = Read-Host "Forward to (code)"
+        if ($tgt) { Forward-Message -MsgIndex ([int]$matches[1]) -TargetCode $tgt -FromCode $MyCode }
         Show-Inbox
         return
     }
@@ -2037,7 +2164,7 @@ function Chat-Session {
             Write-Host "[PIN] $pwho : $($pm.Text)" -ForegroundColor DarkYellow
         }
     }
-    Write-Host "'r' refresh, 'h' history, 'f' file, 'v' voice, '/s' search, 'p' pin, 'd' delete, 'e' edit, 'back' return" -ForegroundColor DarkGray
+    Write-Host "'r' refresh, 'h' history, 'f' file, 'v' voice, '/s' search, '/e' emoji, 'p' pin, 'd' delete, 'e' edit, 'back' return" -ForegroundColor DarkGray
 
     while ($true) {
         $input = Read-Host "You"
@@ -2084,7 +2211,8 @@ function Chat-Session {
                     if ($_.IsEncrypted -and -not $_.IsFS) { $t += "[E]" }
                     if ($_.Edited) { $t += "[ED]" }
                     if ($t) { $t = "$t " }
-                    Write-Host ("[$($_.Time)] ${t}" + $who + ": $($_.Text)") -ForegroundColor White
+                    $rd = Get-ReactionDisplay -Reactions $_.Reactions
+                    Write-Host ("[$($_.Time)] ${t}" + $who + ": $($_.Text)$rd") -ForegroundColor White
                 }
             } else { Write-Host "No messages yet." -ForegroundColor Yellow }
             continue
@@ -2136,7 +2264,13 @@ function Chat-Session {
             }
             continue
         }
+        if ($input -eq "/e") {
+            Write-Host "Available: $($ReactionEmojis -join ' ')" -ForegroundColor Cyan
+            Write-Host "Shortcodes: $($EmojiMap.Keys -join ' ') use :name:" -ForegroundColor DarkGray
+            continue
+        }
         if ($input -eq "") { continue }
+        $input = Expand-Emoji $input
         $ok, $result = Send-Message -TargetCode $TargetCode -Message $input
         if ($ok) {
             Write-Host $result -ForegroundColor Green
@@ -2328,7 +2462,9 @@ function Show-SearchUI {
             if ($m.IsVerified) { $tag += "[V]" }
             if ($m.IsGroup) { $tag += "[G]" }
             if ($tag) { $tag = "$tag " }
-            Write-Host "[$($m.Date) $($m.Time)] ${tag}$who : $($m.Text)" -ForegroundColor White
+            $displayText = Format-MessageText -Text $m.Text
+            $rd = Get-ReactionDisplay -Reactions $m.Reactions
+            Write-Host "[$($m.Date) $($m.Time)] ${tag}$who : $displayText$rd" -ForegroundColor White
         }
     }
     Read-Host "`nPress Enter"
@@ -2537,6 +2673,10 @@ try {
             }
             "20" {
                 Set-MyStatus
+                Read-Host "`nPress Enter"
+            }
+            "21" {
+                Show-MessageStats
                 Read-Host "`nPress Enter"
             }
             "0" { break }
