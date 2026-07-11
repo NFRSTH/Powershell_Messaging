@@ -1,0 +1,14 @@
+# Windows
+Thumbs.db
+*.pfx
+
+# PowerShell
+*.ps1xml
+
+# Temp files
+temp_*
+*~
+*.swp
+
+# User data (generated at runtime)
+.message_app/
