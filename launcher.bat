@@ -16,6 +16,7 @@ echo [6] View Your Code
 echo [7] Help / Info
 echo.
 echo Features: FS ECDH-P521 + RSA Signing + AES-256
+echo Delivery Receipts + Typing + Chat Export + Persistent ID
 echo Rate Limit (10/s), File Sharing, Groups, Search
 echo.
 set /p choice="Select option (1-7): "
@@ -121,7 +122,7 @@ echo To chat locally: Just run the app
 echo To chat online: One person runs relay server
 echo Others connect with -RelayAddress
 echo.
-echo === New Features in v2.0 ===
+echo === New Features in v2.1 ===
 echo.
 echo Forward Secrecy (FS):
 echo   - ECDH-P521 ephemeral key exchange per message
@@ -166,6 +167,22 @@ echo Directory Server:
 echo   [4] Start Directory: registers codes + relay addresses
 echo   [5] Connect to Directory: auto-register on startup
 echo   Directory helps peers find each other by code
+echo.
+echo Delivery Receipts:
+echo   - [D] badge shows when recipient received your message
+echo   - Works over P2P and Relay connections
+echo.
+echo Typing Indicator:
+echo   - See when someone is typing a message
+echo   - Automatic when you start typing in chat
+echo.
+echo Persistent Identity:
+echo   - Your code is now tied to your machine (not IP)
+echo   - Stays the same across reboots and network changes
+echo.
+echo Chat Export:
+echo   - Menu option 19: Export full chat history with a friend
+echo   - Saved to ~/.message_app/chat_export_*.txt
 echo.
 echo Example:
 echo   Person A: launcher.bat [2] - Relay Server (set password)
