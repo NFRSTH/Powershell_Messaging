@@ -28,6 +28,7 @@ $ECDHPubFile = Join-Path $DataDir "ecdh_public.key"
 $DownloadsDir = Join-Path $DataDir "downloads"
 $SentFilesFile = Join-Path $DataDir "sent_files.json"
 $IdentityFile = Join-Path $DataDir "identity.json"
+$StatusFile = Join-Path $DataDir "status.json"
 
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 if (-not (Test-Path $DownloadsDir)) { New-Item -ItemType Directory -Path $DownloadsDir -Force | Out-Null }
@@ -307,6 +308,34 @@ function Decrypt-Message {
     } catch { return $null }
 }
 
+# ========== STATUS / BIO ==========
+
+function Set-MyStatus {
+    Write-Host "`n=== Your Status ===" -ForegroundColor Cyan
+    Write-Host "Current: $(Get-MyStatus)" -ForegroundColor White
+    $newStatus = Read-Host "Enter new status (or blank to clear)"
+    if ($newStatus -eq "") {
+        Remove-Item $StatusFile -Force -ErrorAction SilentlyContinue
+        Write-Host "Status cleared." -ForegroundColor Green
+    } else {
+        $statusObj = [PSCustomObject]@{ Status = $newStatus; Updated = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") }
+        Save-Data $StatusFile $statusObj
+        Write-Host "Status set!" -ForegroundColor Green
+    }
+}
+
+function Get-MyStatus {
+    $data = Load-Data $StatusFile
+    if ($data -and $data.Status) { return $data.Status }
+    return ""
+}
+
+function Get-StatusLine {
+    $s = Get-MyStatus
+    if ($s) { return "Status: $s" }
+    return ""
+}
+
 # ========== RATE LIMITING ==========
 
 function Check-RateLimit {
@@ -319,6 +348,38 @@ function Check-RateLimit {
         $script:RateLimitTimes = @($script:RateLimitTimes | Where-Object { ($now - $_).TotalSeconds -lt 1 })
     }
     $script:RateLimitTimes += $now
+}
+
+# ========== IMAGE PREVIEW ==========
+
+function Get-ImageInfo {
+    param([string]$FilePath)
+    $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+    $imageExts = @(".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff")
+    if ($imageExts -notcontains $ext) { return $null }
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $img = [System.Drawing.Image]::FromFile($FilePath)
+        $w = $img.Width; $h = $img.Height
+        $fmt = $img.RawFormat.ToString()
+        $img.Dispose()
+        $sizeKB = [math]::Round((Get-Item $FilePath).Length / 1KB, 1)
+        return "[IMG ${w}x${h} $fmt ${sizeKB}KB]"
+    } catch { return "[IMG file]" }
+}
+
+function Get-ImageInfoBytes {
+    param([byte[]]$Data)
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $ms = New-Object System.IO.MemoryStream($Data)
+        $img = [System.Drawing.Image]::FromStream($ms)
+        $w = $img.Width; $h = $img.Height
+        $fmt = $img.RawFormat.ToString()
+        $img.Dispose(); $ms.Close()
+        $sizeKB = [math]::Round($Data.Length / 1KB, 1)
+        return "[IMG ${w}x${h} $fmt ${sizeKB}KB]"
+    } catch { return null }
 }
 
 # ========== FILE SHARING ==========
@@ -377,6 +438,8 @@ function Receive-FileChunk {
         try {
             [System.IO.File]::WriteAllBytes($savePath, $allData)
             $sizeKB = [math]::Round($allData.Length / 1KB, 1)
+            $imgInfo = Get-ImageInfo -FilePath $savePath
+            if ($imgInfo) { Write-Host "`n[IMAGE] $($tf.FileName) - $imgInfo" -ForegroundColor Cyan }
             Write-Host "`n[FILE RECEIVED] $($tf.FileName) ($sizeKB KB) saved to $savePath" -ForegroundColor Yellow
         } catch {
             Write-Host "`n[FILE ERROR] Failed to save: $_" -ForegroundColor Red
@@ -693,6 +756,22 @@ $tcpListenerScript = {
         $Data | ConvertTo-Json -Depth 10 | Set-Content $Path -Force -ErrorAction SilentlyContinue
     }
 
+    function Get-ImageInfo {
+        param([string]$FilePath)
+        $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+        $imageExts = @(".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff")
+        if ($imageExts -notcontains $ext) { return $null }
+        try {
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+            $img = [System.Drawing.Image]::FromFile($FilePath)
+            $w = $img.Width; $h = $img.Height
+            $fmt = $img.RawFormat.ToString()
+            $img.Dispose()
+            $sizeKB = [math]::Round((Get-Item $FilePath).Length / 1KB, 1)
+            return "[IMG ${w}x${h} $fmt ${sizeKB}KB]"
+        } catch { return "[IMG file]" }
+    }
+
     function Decrypt-Incoming {
         param([string]$EncKeyB64, [string]$IVB64, [string]$CipherB64)
         try {
@@ -807,6 +886,8 @@ $tcpListenerScript = {
             $savePath = Join-Path $DownloadsDir "$($tf.FromCode)_$safeName"
             try {
                 [System.IO.File]::WriteAllBytes($savePath, $allData)
+                $imgInfo = Get-ImageInfo -FilePath $savePath
+                if ($imgInfo) { Write-Host "`n[IMAGE] $($tf.FileName) - $imgInfo" -ForegroundColor Cyan }
                 Write-Host "`n[FILE] Received: $($tf.FileName) -> $savePath" -ForegroundColor Yellow
             } catch {
                 Write-Host "`n[FILE ERROR] $_" -ForegroundColor Red
@@ -1438,7 +1519,7 @@ function Push-RelayMessages {
                 for ($i = 0; $i -lt $totalChunks; $i++) { if ($tf.Chunks.ContainsKey($i)) { $allData = $allData + $tf.Chunks[$i] } }
                 $safeName = $tf.FileName -replace '[^\w\.\-]', '_'
                 $savePath = Join-Path $DownloadsDir "$($tf.FromCode)_$safeName"
-                try { [System.IO.File]::WriteAllBytes($savePath, $allData); Write-Host "`n[FILE] Received: $($tf.FileName) -> $savePath" -ForegroundColor Yellow }
+                try { [System.IO.File]::WriteAllBytes($savePath, $allData); $imgInfo = Get-ImageInfo -FilePath $savePath; if ($imgInfo) { Write-Host "`n[IMAGE] $($tf.FileName) - $imgInfo" -ForegroundColor Cyan }; Write-Host "`n[FILE] Received: $($tf.FileName) -> $savePath" -ForegroundColor Yellow }
                 catch { Write-Host "`n[FILE ERROR] $_" -ForegroundColor Red }
                 $script:PendingFileTransfer.Remove($key)
             }
@@ -1787,10 +1868,30 @@ function Clear-Chat {
     return $before - $after
 }
 
+function Pin-Message {
+    param([int]$Index)
+    $inbox = @(Load-Data $InboxFile)
+    if ($Index -lt 0 -or $Index -ge $inbox.Count) { return $false, "Invalid index" }
+    $inbox[$Index].Pinned = (-not $inbox[$Index].Pinned)
+    $action = if ($inbox[$Index].Pinned) { "pinned" } else { "unpinned" }
+    Save-Data $InboxFile $inbox
+    return $true, "Message $action"
+}
+
+function Get-PinnedMessages {
+    param([string]$TargetCode)
+    $inbox = @(Load-Data $InboxFile)
+    return @($inbox | Where-Object {
+        $_.Pinned -and (($_.FromCode -eq $TargetCode -and $_.ToCode -eq $MyCode) -or ($_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode))
+    })
+}
+
 function Show-Header {
     Clear-Host
     Write-Host "===== Message App v2.0 =====" -ForegroundColor Cyan
     Write-Host "Your Code: $MyCode" -ForegroundColor Green
+    $statusLine = Get-StatusLine
+    if ($statusLine) { Write-Host $statusLine -ForegroundColor DarkYellow }
     $relayInfo = ""
     if ($script:RelayAddr) {
         $relayInfo = "Relay: $($script:RelayAddr):$($script:RelayPortNum)"
@@ -1838,6 +1939,7 @@ function Show-MainMenu {
     Write-Host "17. Send Voice Note" -ForegroundColor White
     Write-Host "18. Clear Chat" -ForegroundColor White
     Write-Host "19. Export Chat History" -ForegroundColor White
+    Write-Host "20. Set Your Status" -ForegroundColor White
     Write-Host "0. Exit" -ForegroundColor Red
 }
 
@@ -1858,6 +1960,7 @@ function Show-Inbox {
         if ($m.IsVoice) { $tag += "[VN]" }
         if ($m.Edited) { $tag += "[ED]" }
         if ($m.IsSent -and $m.Acked) { $tag += "[D]" }
+        if ($m.Pinned) { $tag += "[PIN]" }
         if ($tag) { $tag = "$tag " }
         $newTag = if (-not $m.Read) { " {NEW}" } else { "" }
         $who = if ($m.IsSent -or $m.FromCode -eq $MyCode) { "You -> $($m.ToCode)" } else { $name }
@@ -1865,9 +1968,15 @@ function Show-Inbox {
         $inbox[$i].Read = $true
     }
     Write-Host "" -ForegroundColor DarkGray
-    $action = Read-Host "d# delete, e# edit, Enter to continue"
+    Write-Host "d# delete | e# edit | p# pin/unpin" -ForegroundColor DarkGray
+    $action = Read-Host "Action (Enter to continue)"
     if ($action -match '^d(\d+)$') {
         $ok, $result = Delete-Message -Index ([int]$matches[1])
+        Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+        Show-Inbox
+        return
+    } elseif ($action -match '^p(\d+)$') {
+        $ok, $result = Pin-Message -Index ([int]$matches[1])
         Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
         Show-Inbox
         return
@@ -1894,12 +2003,33 @@ function Chat-Session {
     else { Write-Host "`nChatting with $displayName ($TargetCode) [no key - first msg plaintext + signed]" -ForegroundColor Yellow }
 
     Send-ECDHKeyExchange $TargetCode | Out-Null
-    Write-Host "'r' refresh, 'h' history, 'f' send file, 'v' voice note, 'd' delete msg, 'e' edit msg, 'back' return" -ForegroundColor DarkGray
+    $pinnedMsgs = Get-PinnedMessages -TargetCode $TargetCode
+    if ($pinnedMsgs.Count -gt 0) {
+        Write-Host "--- Pinned ---" -ForegroundColor DarkYellow
+        foreach ($pm in $pinnedMsgs) {
+            $pwho = if ($pm.IsSent) { "You" } else { $displayName }
+            Write-Host "[PIN] $pwho : $($pm.Text)" -ForegroundColor DarkYellow
+        }
+    }
+    Write-Host "'r' refresh, 'h' history, 'f' file, 'v' voice, '/s' search, 'p' pin, 'd' delete, 'e' edit, 'back' return" -ForegroundColor DarkGray
 
     while ($true) {
         $input = Read-Host "You"
         if ($input -eq "back") { break }
-        if ($input -ne "" -and $input -ne "r" -and $input -ne "h" -and $input -ne "f" -and $input -ne "v" -and $input -ne "d" -and $input -ne "e") {
+        if ($input -match '^/s (.+)$') {
+            $sq = $matches[1]
+            $sResults = Search-Messages -Query $sq -FromCode $TargetCode
+            if ($sResults.Count -eq 0) { Write-Host "No matches." -ForegroundColor Yellow }
+            else {
+                Write-Host "--- Search: '$sq' ($($sResults.Count) results) ---" -ForegroundColor Cyan
+                $sResults | Sort-Object { "$($_.Date) $($_.Time)" } | ForEach-Object {
+                    $swho = if ($_.IsSent) { "You" } else { $displayName }
+                    Write-Host "[$($_.Date) $($_.Time)] $swho : $($_.Text)" -ForegroundColor White
+                }
+            }
+            continue
+        }
+        if ($input -ne "" -and $input -ne "r" -and $input -ne "h" -and $input -ne "f" -and $input -ne "v" -and $input -ne "d" -and $input -ne "e" -and $input -ne "p") {
             $ip = Discover-IP $TargetCode
             if ($ip) {
                 try {
@@ -1963,6 +2093,23 @@ function Chat-Session {
             try { $ok, $result = Edit-Message -Index ([int]$idx) -NewText $newText; Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" }) } catch { Write-Host "Invalid" -ForegroundColor Red }
             continue
         }
+        if ($input -eq "p") {
+            $inboxP = @(Load-Data $InboxFile)
+            $convoP = @($inboxP | Where-Object { ($_.FromCode -eq $TargetCode -and $_.ToCode -eq $MyCode) -or ($_.FromCode -eq $MyCode -and $_.ToCode -eq $TargetCode) })
+            if ($convoP.Count -eq 0) { Write-Host "No messages to pin." -ForegroundColor Yellow; continue }
+            Write-Host "--- Messages (select index to pin/unpin) ---" -ForegroundColor DarkGray
+            for ($pi = 0; $pi -lt $convoP.Count; $pi++) {
+                $mp = $convoP[$pi]
+                $pwho = if ($mp.IsSent -or $mp.FromCode -eq $MyCode) { "You" } else { $displayName }
+                $pinTag = if ($mp.Pinned) { "[PIN] " } else { "" }
+                Write-Host "[$pi] ${pinTag}$pwho : $($mp.Text)" -ForegroundColor White
+            }
+            $pIdx = Read-Host "Index to pin/unpin (c to cancel)"
+            if ($pIdx -ne "c") {
+                try { $actualIdx = [array]::IndexOf($inboxP, $convoP[[int]$pIdx]); $okP, $resultP = Pin-Message -Index $actualIdx; Write-Host $resultP -ForegroundColor $(if ($okP) { "Green" } else { "Red" }) } catch { Write-Host "Invalid" -ForegroundColor Red }
+            }
+            continue
+        }
         if ($input -eq "") { continue }
         $ok, $result = Send-Message -TargetCode $TargetCode -Message $input
         if ($ok) {
@@ -1984,6 +2131,8 @@ function Get-FriendStatus {
 function Show-FriendsList {
     if ($script:Friends.Count -eq 0) { Write-Host "`nNo friends in your list." -ForegroundColor Yellow; return }
     Write-Host "`n=== Friends List ===" -ForegroundColor Cyan
+    $myBio = Get-MyStatus
+    if ($myBio) { Write-Host "Your status: $myBio" -ForegroundColor DarkYellow }
     for ($i = 0; $i -lt $script:Friends.Count; $i++) {
         $f = $script:Friends[$i]
         $keyStatus = ""
@@ -1994,6 +2143,8 @@ function Show-FriendsList {
         $statusColor = if ($status -eq "Online") { "Green" } elseif ($status -eq "Relay") { "Yellow" } else { "DarkGray" }
         Write-Host "[$i] $($f.Name)  |  $($f.Code)  $keyStatus  " -NoNewline -ForegroundColor White
         Write-Host "($status)" -ForegroundColor $statusColor
+        $pinned = Get-PinnedMessages -TargetCode $f.Code
+        if ($pinned.Count -gt 0) { Write-Host "      Pin: $($pinned[0].Text)" -ForegroundColor DarkYellow }
     }
 }
 
@@ -2356,6 +2507,10 @@ try {
                     $f = $script:Friends[[int]$fIdx]
                     Export-Chat -TargetCode $f.Code
                 } catch { Write-Host "Invalid." -ForegroundColor Red }
+                Read-Host "`nPress Enter"
+            }
+            "20" {
+                Set-MyStatus
                 Read-Host "`nPress Enter"
             }
             "0" { break }
