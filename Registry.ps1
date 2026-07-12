@@ -57,20 +57,25 @@ try {
                     $data = $body | ConvertFrom-Json
                     $reg = Load-Registry
                     $existing = $reg | Where-Object { $_.Code -eq $data.Code }
-                    $entry = [PSCustomObject]@{
-                        Code = $data.Code
-                        PublicKey = $data.PublicKey
-                        RelayAddress = $data.RelayAddress
-                        DirectAddress = $data.DirectAddress
-                        IP = $data.IP
-                        LastSeen = (Get-Date).ToString("o")
+                    if ($existing -and -not $data.Signature) {
+                        $status = 403
+                        $result = '{"status":"error","message":"Signature required to update registration"}'
+                    } else {
+                        $entry = [PSCustomObject]@{
+                            Code = $data.Code
+                            PublicKey = $data.PublicKey
+                            RelayAddress = $data.RelayAddress
+                            DirectAddress = $data.DirectAddress
+                            IP = $data.IP
+                            LastSeen = (Get-Date).ToString("o")
+                        }
+                        if ($existing) {
+                            $reg = @($reg | Where-Object { $_.Code -ne $data.Code })
+                        }
+                        $reg += $entry
+                        Save-Registry $reg
+                        $result = '{"status":"ok"}'
                     }
-                    if ($existing) {
-                        $reg = @($reg | Where-Object { $_.Code -ne $data.Code })
-                    }
-                    $reg += $entry
-                    Save-Registry $reg
-                    $result = '{"status":"ok"}'
                 } catch { $status = 400; $result = '{"status":"error","message":"Invalid JSON"}' }
 
             } elseif ($req.HttpMethod -eq "GET" -and $path -eq "/find") {
@@ -99,8 +104,8 @@ try {
             $resp.ContentLength64 = $buffer.Length
             $resp.OutputStream.Write($buffer, 0, $buffer.Length)
         } catch {
-            $err = '{"status":"error","message":"' + $_.Exception.Message.Replace('"','''') + '"}'
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($err)
+            $result = @{ status = "error"; message = "Internal server error" } | ConvertTo-Json
+            $buffer = [System.Text.Encoding]::UTF8.GetBytes($result)
             $resp.ContentType = "application/json"
             $resp.StatusCode = 500
             $resp.ContentLength64 = $buffer.Length

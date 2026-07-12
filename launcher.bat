@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 title Message App - Secure Chat
 color 0A
 cls
@@ -50,10 +51,10 @@ if not "%relaypass%"=="" (
     set /p httpport="HTTP wrapper port (0 to disable): "
 )
 set args=-RelayPort "%port%"
-if not "%relaypass%"=="" set args=%args% -RelayPassword "%relaypass%"
-if /i "%obfuscate%"=="y" set args=%args% -RelayObfuscate
-if not "%httpport%"=="" if not "%httpport%"=="0" set args=%args% -RelayObfuscatePort "%httpport%"
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" %args%
+if not "%relaypass%"=="" set "args=!args! -RelayPassword "%relaypass%""
+if /i "%obfuscate%"=="y" set "args=!args! -RelayObfuscate"
+if not "%httpport%"=="" if not "%httpport%"=="0" set "args=!args! -RelayObfuscatePort "%httpport%""
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" !args!
 goto end
 
 :connect
@@ -68,11 +69,11 @@ if not "%relaypass%"=="" (
     set /p httpport="HTTP wrapper port (0 to disable): "
 )
 set args=-RelayAddress "%address%"
-if not "%relaypass%"=="" set args=%args% -RelayPassword "%relaypass%"
-if /i "%obfuscate%"=="y" set args=%args% -RelayObfuscate
-if not "%proxyaddr%"=="" set args=%args% -RelayProxy "%proxyaddr%"
-if not "%httpport%"=="" if not "%httpport%"=="0" set args=%args% -RelayObfuscatePort "%httpport%"
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" %args%
+if not "%relaypass%"=="" set "args=!args! -RelayPassword "%relaypass%""
+if /i "%obfuscate%"=="y" set "args=!args! -RelayObfuscate"
+if not "%proxyaddr%"=="" set "args=!args! -RelayProxy "%proxyaddr%""
+if not "%httpport%"=="" if not "%httpport%"=="0" set "args=!args! -RelayObfuscatePort "%httpport%""
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" !args!
 goto end
 
 :registrysrv
@@ -95,14 +96,16 @@ if not "%relaypass%"=="" (
     set /p proxyaddr="SOCKS5/HTTP proxy (e.g., 127.0.0.1:1080, blank=none): "
     set /p httpport="HTTP wrapper port (0 to disable): "
 )
+setlocal enabledelayedexpansion
 set args=-RegistryAddress "%regaddr%"
-if not "%relaypass%"=="" set args=%args% -RelayPassword "%relaypass%"
-if /i "%obfuscate%"=="y" set args=%args% -RelayObfuscate
-if not "%proxyaddr%"=="" set args=%args% -RelayProxy "%proxyaddr%"
-if not "%httpport%"=="" if not "%httpport%"=="0" set args=%args% -RelayObfuscatePort "%httpport%"
+if not "%relaypass%"=="" set "args=!args! -RelayPassword "%relaypass%""
+if /i "%obfuscate%"=="y" set "args=!args! -RelayObfuscate"
+if not "%proxyaddr%"=="" set "args=!args! -RelayProxy "%proxyaddr%""
+if not "%httpport%"=="" if not "%httpport%"=="0" set "args=!args! -RelayObfuscatePort "%httpport%""
 set /p relayaddr="Enter relay address (optional, e.g., myserver.com:9999): "
-if not "%relayaddr%"=="" set args=%args% -RelayAddress "%relayaddr%"
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" %args%
+if not "%relayaddr%"=="" set "args=!args! -RelayAddress "%relayaddr%""
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0Message.ps1" !args!
+endlocal
 goto end
 
 :code
@@ -194,3 +197,4 @@ pause
 goto end
 
 :end
+endlocal

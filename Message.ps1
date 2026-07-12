@@ -56,7 +56,12 @@ $script:EmojiMap = @{
 function Expand-Emoji {
     param([string]$Text)
     $text = $Text
-    foreach ($kv in $script:EmojiMap.GetEnumerator()) { $text = $text -replace ":$($kv.Key):", $kv.Value }
+    $map = $script:EmojiMap
+    foreach ($kv in $map.GetEnumerator()) {
+        $key = $kv.Key; $val = $kv.Value
+        $sb = { param($m) $val }.GetNewClosure()
+        $text = [regex]::Replace($text, ":$([regex]::Escape($key)):", $sb)
+    }
     return $text
 }
 
@@ -93,6 +98,7 @@ function Save-Data {
         Move-Item -Path $tempPath -Destination $Path -Force -ErrorAction Stop
     } catch {
         Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+        Write-Warning "Failed to save $Path : $_"
     }
 }
 
@@ -100,6 +106,7 @@ $script:RateLimitTimes = @()
 $script:PendingFileTransfer = @{}
 $script:ChatKeyCache = @{}
 $script:FileSendQueue = @{}
+$relayServerJob = $null
 
 function Get-LocalIP {
     try {
@@ -130,7 +137,8 @@ function Get-PersistentCode {
         $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($source))
         $sha256.Dispose()
         $id = -join ($hash[0..3] | ForEach-Object { $_.ToString("x2") })
-        $code = ($id.Substring(0,4) + "-" + $id.Substring(4,4)).ToUpper()
+        if ($id.Length -ge 8) { $code = ($id.Substring(0,4) + "-" + $id.Substring(4,4)).ToUpper() }
+        else { $code = $id.PadRight(8, '0').ToUpper(); $code = $code.Substring(0,4) + "-" + $code.Substring(4,4) }
         $identity = [PSCustomObject]@{ Code = $code; Created = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") }
         $identity | ConvertTo-Json -Depth 5 | Set-Content $IdentityFile -Force -ErrorAction SilentlyContinue
     }
@@ -226,6 +234,7 @@ function Encrypt-For {
     param([string]$TargetCode, [string]$Message)
     $pubKey = Get-PublicKeyForCode $TargetCode
     if (-not $pubKey) { return $null }
+    $rsa = $null; $aes = $null
     try {
         $rsa = [System.Security.Cryptography.RSA]::Create()
         $rsa.FromXmlString($pubKey)
@@ -239,14 +248,13 @@ function Encrypt-For {
         $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($Message)
         $cipherBytes = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
         $encKey = $rsa.Encrypt($aesKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
-        $rsa.Dispose()
-        $aes.Dispose()
         return [PSCustomObject]@{
             EncKeyB64 = [Convert]::ToBase64String($encKey)
             IVB64     = [Convert]::ToBase64String($aesIV)
             CipherB64 = [Convert]::ToBase64String($cipherBytes)
         }
     } catch { return $null }
+    finally { if ($rsa) { $rsa.Dispose() }; if ($aes) { $aes.Dispose() } }
 }
 
 function Sign-Message {
@@ -280,6 +288,7 @@ function Encrypt-FS {
     param([string]$TargetCode, [string]$Message)
     $ecdhPubB64 = Get-ECDHKeyForCode $TargetCode
     if (-not $ecdhPubB64) { return $null }
+    $recipientEcdh = $null; $ephEcdh = $null; $aes = $null
     try {
         $pubBlob = [Convert]::FromBase64String($ecdhPubB64)
         $recipientCngKey = [System.Security.Cryptography.CngKey]::Import($pubBlob, [System.Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
@@ -287,8 +296,6 @@ function Encrypt-FS {
         $ephEcdh = New-Object System.Security.Cryptography.ECDiffieHellmanCng(521)
         $aesKey = $ephEcdh.DeriveKeyMaterial($recipientEcdh.PublicKey)
         $ephPubBlob = $ephEcdh.PublicKey.ToByteArray()
-        $ephEcdh.Dispose()
-        $recipientEcdh.Dispose()
         $aes = [System.Security.Cryptography.Aes]::Create()
         $aes.KeySize = 256
         $aes.Key = $aesKey
@@ -298,7 +305,6 @@ function Encrypt-FS {
         $cipherBytes = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
         $ivB64 = [Convert]::ToBase64String($aes.IV)
         $cipherB64 = [Convert]::ToBase64String($cipherBytes)
-        $aes.Dispose()
         $ephPubKeyB64 = [Convert]::ToBase64String($ephPubBlob)
         $sigData = "$ephPubKeyB64|$ivB64|$cipherB64"
         $signature = Sign-Message $sigData
@@ -309,10 +315,12 @@ function Encrypt-FS {
             SignatureB64 = $signature
         }
     } catch { return $null }
+    finally { if ($recipientEcdh) { $recipientEcdh.Dispose() }; if ($ephEcdh) { $ephEcdh.Dispose() }; if ($aes) { $aes.Dispose() } }
 }
 
 function Decrypt-FS {
     param([string]$SenderCode, [string]$EphPubKeyB64, [string]$IVB64, [string]$CipherB64, [string]$SignatureB64)
+    $myEcdh = $null; $ephEcdh = $null; $aes = $null
     try {
         $sigData = "$EphPubKeyB64|$IVB64|$CipherB64"
         $verified = Verify-Signature $sigData $SignatureB64 $SenderCode
@@ -325,35 +333,33 @@ function Decrypt-FS {
         $ephKey = [System.Security.Cryptography.CngKey]::Import($ephPubBlob, [System.Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
         $ephEcdh = New-Object System.Security.Cryptography.ECDiffieHellmanCng($ephKey)
         $aesKey = $myEcdh.DeriveKeyMaterial($ephEcdh.PublicKey)
-        $myEcdh.Dispose()
-        $ephEcdh.Dispose()
         $aes = [System.Security.Cryptography.Aes]::Create()
         $aes.KeySize = 256
         $aes.Key = $aesKey
         $aes.IV = [Convert]::FromBase64String($IVB64)
         $decryptor = $aes.CreateDecryptor()
         $plainBytes = $decryptor.TransformFinalBlock([Convert]::FromBase64String($CipherB64), 0, ([Convert]::FromBase64String($CipherB64)).Length)
-        $aes.Dispose()
         $plainText = [System.Text.Encoding]::UTF8.GetString($plainBytes)
         return @{ Text = $plainText; Verified = $verified }
     } catch { return $null }
+    finally { if ($myEcdh) { $myEcdh.Dispose() }; if ($ephEcdh) { $ephEcdh.Dispose() }; if ($aes) { $aes.Dispose() } }
 }
 
 function Decrypt-Message {
     param([string]$EncKeyB64, [string]$IVB64, [string]$CipherB64)
+    $rsa = $null; $aes = $null
     try {
         $rsa = [System.Security.Cryptography.RSA]::Create()
         $rsa.FromXmlString((Get-Content $PrivateKeyFile -Raw))
         $aesKey = $rsa.Decrypt([Convert]::FromBase64String($EncKeyB64), [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
-        $rsa.Dispose()
         $aes = [System.Security.Cryptography.Aes]::Create()
         $aes.Key = $aesKey
         $aes.IV = [Convert]::FromBase64String($IVB64)
         $decryptor = $aes.CreateDecryptor()
         $plainBytes = $decryptor.TransformFinalBlock([Convert]::FromBase64String($CipherB64), 0, ([Convert]::FromBase64String($CipherB64)).Length)
-        $aes.Dispose()
         return [System.Text.Encoding]::UTF8.GetString($plainBytes)
     } catch { return $null }
+    finally { if ($rsa) { $rsa.Dispose() }; if ($aes) { $aes.Dispose() } }
 }
 
 # ========== STATUS / BIO ==========
@@ -427,7 +433,7 @@ function Get-ImageInfoBytes {
         $img.Dispose(); $ms.Close()
         $sizeKB = [math]::Round($Data.Length / 1KB, 1)
         return "[IMG ${w}x${h} $fmt ${sizeKB}KB]"
-    } catch { return null }
+    } catch { return $null }
 }
 
 # ========== FILE SHARING ==========
@@ -436,25 +442,27 @@ function Send-File {
     param([string]$TargetCode, [string]$FilePath)
     if (-not (Test-Path $FilePath)) { return $false, "File not found" }
     try {
-        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
         $fileName = Split-Path $FilePath -Leaf
         $fileNameB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($fileName))
-        $totalSize = $fileBytes.Length
+        $totalSize = (Get-Item $FilePath).Length
         $maxChunkSize = 500KB
         $totalChunks = [math]::Ceiling($totalSize / $maxChunkSize)
-        for ($i = 0; $i -lt $totalChunks; $i++) {
-            $offset = $i * $maxChunkSize
-            $chunkSize = [math]::Min($maxChunkSize, $totalSize - $offset)
-            $chunkBytes = $fileBytes[$offset..($offset + $chunkSize - 1)]
-            $chunkB64 = [Convert]::ToBase64String($chunkBytes)
-            $meta = "FILE|$fileNameB64|$totalChunks|$i|$chunkB64"
-            $chunkPayload = "2|$meta"
-            $ok = Send-MessageRaw -TargetCode $TargetCode -Payload $chunkPayload
-            if (-not $ok) { return $false, "Failed at chunk $i/$totalChunks" }
-            $pct = [math]::Round(($i + 1) / $totalChunks * 100)
-            Write-Host "  Sent chunk $($i+1)/$totalChunks ($pct%)" -ForegroundColor DarkGray
-            Start-Sleep -Milliseconds 50
-        }
+        $fs = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $buffer = New-Object byte[] $maxChunkSize
+            for ($i = 0; $i -lt $totalChunks; $i++) {
+                $bytesRead = $fs.Read($buffer, 0, $maxChunkSize)
+                $chunkData = if ($bytesRead -eq $maxChunkSize) { $buffer } else { $buffer[0..($bytesRead - 1)] }
+                $chunkB64 = [Convert]::ToBase64String($chunkData)
+                $meta = "FILE|$fileNameB64|$totalChunks|$i|$chunkB64"
+                $chunkPayload = "2|$meta"
+                $ok = Send-MessageRaw -TargetCode $TargetCode -Payload $chunkPayload
+                if (-not $ok) { return $false, "Failed at chunk $i/$totalChunks" }
+                $pct = [math]::Round(($i + 1) / $totalChunks * 100)
+                Write-Host "  Sent chunk $($i+1)/$totalChunks ($pct%)" -ForegroundColor DarkGray
+                Start-Sleep -Milliseconds 50
+            }
+        } finally { $fs.Close() }
         return $true, "File sent: $fileName ($totalChunks chunks)"
     } catch { return $false, "Error: $_" }
 }
@@ -473,7 +481,9 @@ function Receive-FileChunk {
         }
     }
     $tf = $script:PendingFileTransfer[$key]
-    if ($ChunkIndex -lt $TotalChunks) { $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64) }
+    if ($ChunkIndex -ge 0 -and $ChunkIndex -lt $TotalChunks -and -not $tf.Chunks.ContainsKey($ChunkIndex)) {
+        $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+    }
     if ($tf.Chunks.Count -eq $TotalChunks) {
         $allData = New-Object byte[] 0
         for ($i = 0; $i -lt $TotalChunks; $i++) {
@@ -506,6 +516,7 @@ function Send-MessageRaw {
     Check-RateLimit
     $ip = Discover-IP $TargetCode
     if ($ip) {
+        $client = $null
         try {
             $client = New-Object System.Net.Sockets.TcpClient
             $client.Connect($ip, $ChatPort)
@@ -515,25 +526,17 @@ function Send-MessageRaw {
             $writer.WriteLine("$MyCode|$MyIP||$Payload")
             $writer.Flush()
             $writer.Close()
-            $client.Close()
             return $true
         } catch { }
+        finally { if ($client) { try { $client.Close() } catch {} } }
     }
     if ($script:RelayAddr) {
         return Relay-Send $TargetCode "" $Payload
     }
     $regRelay = Find-User $TargetCode
-    if ($regRelay) {
-        $savedAddr = $script:RelayAddr
-        $savedPort = $script:RelayPortNum
-        if ($regRelay -match '^(.+):(\d+)$') {
-            $script:RelayAddr = $matches[1]
-            $script:RelayPortNum = [int]$matches[2]
-            $ok = Relay-Send $TargetCode "" $Payload
-            $script:RelayAddr = $savedAddr
-            $script:RelayPortNum = $savedPort
-            if ($ok) { return $true }
-        }
+    if ($regRelay -match '^(.+):(\d+)$') {
+        $ok = Relay-Send $TargetCode "" $Payload -RelayHost $matches[1] -RelayPortOverride ([int]$matches[2])
+        if ($ok) { return $true }
     }
     return $false
 }
@@ -606,20 +609,12 @@ function Send-Message {
             return $false, "User offline (relay)"
         }
         $regRelay = Find-User $TargetCode
-        if ($regRelay) {
-            $savedAddr = $script:RelayAddr
-            $savedPort = $script:RelayPortNum
-            if ($regRelay -match '^(.+):(\d+)$') {
-                $script:RelayAddr = $matches[1]
-                $script:RelayPortNum = [int]$matches[2]
-                $ok = Relay-Send $TargetCode $sendPubKeyB64 $payload
-                $script:RelayAddr = $savedAddr
-                $script:RelayPortNum = $savedPort
-                if ($ok) {
-                    $label = if ($usedFS) { "Sent (Dir-Relay, FS)" } else { "Sent (Dir-Relay)" }
-                    Save-MySentMessage $TargetCode $Message $usedFS -Encrypted $usedEncryption
-                    return $true, $label
-                }
+        if ($regRelay -match '^(.+):(\d+)$') {
+            $ok = Relay-Send $TargetCode $sendPubKeyB64 $payload -RelayHost $matches[1] -RelayPortOverride ([int]$matches[2])
+            if ($ok) {
+                $label = if ($usedFS) { "Sent (Dir-Relay, FS)" } else { "Sent (Dir-Relay)" }
+                Save-MySentMessage $TargetCode $Message $usedFS -Encrypted $usedEncryption
+                return $true, $label
             }
         }
         if ($retryCount -eq 0) {
@@ -932,7 +927,9 @@ $tcpListenerScript = {
             }
         }
         $tf = $script:PendingFileTransfer[$key]
-        if ($ChunkIndex -lt $TotalChunks) { $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64) }
+        if ($ChunkIndex -ge 0 -and $ChunkIndex -lt $TotalChunks -and -not $tf.Chunks.ContainsKey($ChunkIndex)) {
+            $tf.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+        }
         if ($tf.Chunks.Count -eq $TotalChunks) {
             $allData = New-Object byte[] 0
             for ($i = 0; $i -lt $TotalChunks; $i++) {
@@ -967,7 +964,9 @@ $tcpListenerScript = {
             $script:VoiceChunks[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration }
         }
         $vb = $script:VoiceChunks[$key]
-        $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+        if ($ChunkIndex -ge 0 -and $ChunkIndex -lt $TotalChunks -and -not $vb.Chunks.ContainsKey($ChunkIndex)) {
+            $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+        }
         if ($vb.Chunks.Count -eq $TotalChunks) {
             $allData = New-Object byte[] 0
             for ($i = 0; $i -lt $TotalChunks; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
@@ -1031,7 +1030,6 @@ $tcpListenerScript = {
                                         Write-Host "`n[DELIVERED] $ackedCode received your message" -ForegroundColor Green
                                         Write-Host -NoNewline "> " -ForegroundColor Green
                                         $updated = $true
-                                        break
                                     }
                                 }
                                 if ($updated) { Save-JData $InboxFile $inboxAck }
@@ -1208,7 +1206,11 @@ function Connect-viaProxy {
         if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($pb) }
         $req = [byte[]]@(5,1,0,3,[byte]$ab.Length) + $ab + $pb
         $ns.Write($req,0,$req.Length)
-        $rb = New-Object byte[] 10; $ns.Read($rb,0,10)
+        $respHead = New-Object byte[] 4; $ns.Read($respHead, 0, 4)
+        if ($respHead[1] -ne 0) { $tcp.Close(); return $null }
+        $atyp = $respHead[3]
+        $addrLen = if ($atyp -eq 1) { 4 } elseif ($atyp -eq 4) { 16 } elseif ($atyp -eq 3) { $ns.ReadByte() } else { 0 }
+        $pad = New-Object byte[] ($addrLen + 2); $ns.Read($pad, 0, $pad.Length)
     } elseif ($proto -eq "http") {
         $w = New-Object System.IO.StreamWriter($ns)
         $r = New-Object System.IO.StreamReader($ns)
@@ -1285,7 +1287,7 @@ $relayServerScript = {
                 $writer = New-Object System.IO.StreamWriter($ns)
                 $raw = $reader.ReadToEnd()
                 if (-not $raw) { $reader.Close(); $writer.Close(); $client.Close(); continue }
-                $isHttp = $raw -match '^(POST|GET|PUT) '
+                $isHttp = $raw -match '^(POST|GET|PUT)\s+\S+\s+HTTP/'
                 if ($isHttp) { $raw = (Unwrap-Http $raw) }
                 $lines = $raw -split "`n" | ForEach-Object { $_.Trim("`r") }
                 $authenticated = !$hasAuth
@@ -1295,7 +1297,7 @@ $relayServerScript = {
                     if ($hasAuth -and $line -match '^AUTH\|(.+)$') {
                         if ($matches[1] -eq $RelayPassword) { $authenticated = $true; $resp = "AUTH_OK" }
                         else { $resp = "AUTH_FAIL" }
-                    } elseif ($authenticated -and $line -match '^SEND\|(.+)\|(.+)\|(.*)\|(.+)$') {
+                    } elseif ($authenticated -and $line -match '^SEND\|(.+?)\|(.+?)\|(.*?)\|(.+)$') {
                         $toCode = $matches[2]; $pubKey = $matches[3]; $payload = $matches[4]
                         $msgs = @(Load-RData $RelayMsgsFile)
                         if (-not $msgs.ContainsKey($toCode)) { $msgs[$toCode] = @() }
@@ -1351,7 +1353,16 @@ if ($RegistryAddress) {
     Write-Host "Registering with directory: $RegistryAddress ..." -ForegroundColor DarkYellow
     $regOk = Register-User
     if ($regOk) { Write-Host "Registered at directory." -ForegroundColor Green }
-    else { Write-Host "Directory registration failed (will retry)." -ForegroundColor Yellow }
+    else {
+        Write-Host "Directory registration failed (will retry in background)." -ForegroundColor Yellow
+        $script:RegRetryJob = Start-Job -Name "RegRetry" -ScriptBlock {
+            param($RegistryAddress, $MyCode, $MyPublicKeyB64, $MyIP, $ChatPort, $RelayAddr, $RelayPortNum)
+            Start-Sleep -Seconds 30
+            $relayAddr = if ($RelayAddr) { "$RelayAddr`:$RelayPortNum" } else { "" }
+            $body = @{ Code = $MyCode; PublicKey = $MyPublicKeyB64; RelayAddress = $relayAddr; DirectAddress = "$MyIP`:$ChatPort"; IP = $MyIP } | ConvertTo-Json
+            try { Invoke-RestMethod -Uri "$RegistryAddress/register" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 | Out-Null } catch {}
+        } -ArgumentList $RegistryAddress, $MyCode, $MyPublicKeyB64, $MyIP, $ChatPort, $script:RelayAddr, $script:RelayPortNum
+    }
 }
 
 Start-Sleep -Milliseconds 500
@@ -1369,7 +1380,7 @@ function Get-RelayConn {
     }
     $ns = $tcp.GetStream()
     if ($RelayPassword) {
-        $ssl = New-Object System.Net.Security.SslStream($ns, $false, { param($s,$c,$ch,$err) $true })
+        $ssl = New-Object System.Net.Security.SslStream($ns, $false, { param($s,$c,$ch,$err) $err -eq $null })
         $ssl.AuthenticateAsClient("MessageAppRelay", $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
         $ns = $ssl
     }
@@ -1377,8 +1388,14 @@ function Get-RelayConn {
 }
 
 function Relay-Send {
-    param([string]$ToCode, [string]$PubKeyB64, [string]$Payload)
-    if (-not $script:RelayAddr) { return $false }
+    param([string]$ToCode, [string]$PubKeyB64, [string]$Payload, [string]$RelayHost = "", [int]$RelayPortOverride = 0)
+    $useAddr = if ($RelayHost) { $RelayHost } else { $script:RelayAddr }
+    $usePort = if ($RelayPortOverride) { $RelayPortOverride } else { $script:RelayPortNum }
+    if (-not $useAddr) { return $false }
+    $savedAddr = $script:RelayAddr
+    $savedPort = $script:RelayPortNum
+    $script:RelayAddr = $useAddr
+    $script:RelayPortNum = $usePort
     try {
         $conn = Get-RelayConn
         if (-not $conn) { return $false }
@@ -1417,6 +1434,7 @@ function Relay-Send {
         }
         return $ok
     } catch { return $false }
+    finally { $script:RelayAddr = $savedAddr; $script:RelayPortNum = $savedPort }
 }
 
 function Relay-Recv {
@@ -1468,6 +1486,7 @@ function Discover-IP {
         if ($cached -is [hashtable] -and $cached.Expires -gt (Get-Date)) { return $cached.IP }
         if ($cached -is [string]) { return $cached }
     }
+    $udp = $null
     try {
         $udp = New-Object System.Net.Sockets.UdpClient
         $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
@@ -1491,13 +1510,12 @@ function Discover-IP {
                     if ($rParts.Count -ge 4 -and $rParts[3]) {
                         try { Save-PublicKey $TargetCode ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rParts[3]))) } catch {}
                     }
-                    $udp.Close()
                     return $ip
                 }
             } catch { break }
         }
-        $udp.Close()
     } catch {}
+    finally { if ($udp) { try { $udp.Close() } catch {} } }
     $script:IPCache[$TargetCode] = @{ IP = $null; Expires = (Get-Date).AddSeconds($script:IPCacheTTL) }
     return $null
 }
@@ -1547,7 +1565,6 @@ function Push-RelayMessages {
                     Write-Host "`n[DELIVERED] $senderCode received your message" -ForegroundColor Green
                     Write-Host -NoNewline "> " -ForegroundColor Green
                     $updated = $true
-                    break
                 }
             }
             if ($updated) { Save-Data $InboxFile $inboxAck }
@@ -1571,28 +1588,8 @@ function Push-RelayMessages {
             if ($decrypted) { $displayMsg = $decrypted; $isEncrypted = $true; $tag = "[E] " }
             else { $displayMsg = "[Decryption failed]"; $tag = "[ERR] " }
         } elseif ($type -eq "2" -and $content -match '^FILE\|(.+)\|(\d+)\|(\d+)\|(.+)$') {
-            $fileNameB64 = $matches[1]
-            $totalChunks = [int]$matches[2]
-            $chunkIndex = [int]$matches[3]
-            $chunkB64 = $matches[4]
-            $fileName = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($fileNameB64))
-            $key = "$senderCode`:$fileName"
-            if (-not $script:PendingFileTransfer.ContainsKey($key)) {
-                $script:PendingFileTransfer[$key] = @{ FileName = $fileName; FromCode = $senderCode; TotalChunks = $totalChunks; Chunks = @{}; Received = (Get-Date) }
-            }
-            $tf = $script:PendingFileTransfer[$key]
-            if ($chunkIndex -lt $totalChunks) { $tf.Chunks[$chunkIndex] = [Convert]::FromBase64String($chunkB64) }
-            if ($tf.Chunks.Count -eq $totalChunks) {
-                $allData = New-Object byte[] 0
-                for ($i = 0; $i -lt $totalChunks; $i++) { if ($tf.Chunks.ContainsKey($i)) { $allData = $allData + $tf.Chunks[$i] } }
-                $safeName = $tf.FileName -replace '[^\w\.\-]', '_'
-                $safeCode = $tf.FromCode -replace '[^\w\.\-]', '_'
-                $savePath = Join-Path $DownloadsDir "${safeCode}_$safeName"
-                try { [System.IO.File]::WriteAllBytes($savePath, $allData); $imgInfo = Get-ImageInfo -FilePath $savePath; if ($imgInfo) { Write-Host "`n[IMAGE] $($tf.FileName) - $imgInfo" -ForegroundColor Cyan }; Write-Host "`n[FILE] Received: $($tf.FileName) -> $savePath" -ForegroundColor Yellow }
-                catch { Write-Host "`n[FILE ERROR] $_" -ForegroundColor Red }
-                $script:PendingFileTransfer.Remove($key)
-            }
-            $displayMsg = "[File: $fileName chunk $($chunkIndex+1)/$totalChunks]"
+            Receive-FileChunk -FromCode $senderCode -FileNameB64 $matches[1] -TotalChunks ([int]$matches[2]) -ChunkIndex ([int]$matches[3]) -ChunkB64 $matches[4] | Out-Null
+            $displayMsg = "[File: chunk $([int]$matches[3]+1)/$([int]$matches[2])]"
             $tag = "[FILE] "
         } elseif ($type -eq "VN" -and $content -match '^(\d+)\|(.+)\|(\d+)\|(\d+)\|(.+)$') {
             $isVoice = $true
@@ -1606,14 +1603,16 @@ function Push-RelayMessages {
                 $script:VoiceChunkBuffer[$vkey] = @{ Chunks = @{}; Total = $voiceTotal; Duration = $voiceDuration; Received = (Get-Date) }
             }
             $vb = $script:VoiceChunkBuffer[$vkey]
-            $vb.Chunks[$voiceIdx] = [Convert]::FromBase64String($voiceB64)
+            if ($voiceIdx -ge 0 -and $voiceIdx -lt $voiceTotal -and -not $vb.Chunks.ContainsKey($voiceIdx)) {
+                $vb.Chunks[$voiceIdx] = [Convert]::FromBase64String($voiceB64)
+            }
             if ($vb.Chunks.Count -eq $voiceTotal) {
                 $allData = New-Object byte[] 0
                 for ($i = 0; $i -lt $voiceTotal; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
                 $script:VoiceChunkBuffer.Remove($vkey)
                 Write-Host "`n[VOICE NOTE] $($vb.Duration)sec from $senderCode. Playing..." -ForegroundColor Magenta
                 $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "voice_relay_$senderCode.wav"
-                try { [System.IO.File]::WriteAllBytes($tempFile, $allData); $player = New-Object System.Media.SoundPlayer($tempFile); $player.PlaySync(); $player.Dispose(); Remove-Item $tempFile -Force -ErrorAction SilentlyContinue } catch {}
+                try { [System.IO.File]::WriteAllBytes($tempFile, $allData); $player = New-Object System.Media.SoundPlayer($tempFile); $player.Play(); $player.Dispose(); Start-Sleep -Milliseconds 100; Remove-Item $tempFile -Force -ErrorAction SilentlyContinue } catch {}
             }
             $displayMsg = "[Voice $voiceDuration sec chunk $($voiceIdx+1)/$voiceTotal]"
             $tag = "[VN] "
@@ -1654,8 +1653,6 @@ function Push-RelayMessages {
         }
     }
 }
-
-$script:PendingFileTransfer = @{}
 
 # ========== VOICE RECORDER (C# P/Invoke via winmm.dll) ==========
 
@@ -1782,7 +1779,7 @@ public class VoiceRecorder
         waveInClose(waveInHandle);
 
         uint bytesRecorded = header.dwBytesRecorded;
-        if (bytesRecorded == 0) bytesRecorded = (uint)totalBytes;
+        if (bytesRecorded == 0) { bufHandle.Free(); cbHandle.Free(); return null; }
 
         bufHandle.Free();
         cbHandle.Free();
@@ -1888,7 +1885,9 @@ function Receive-VoiceChunk {
         $script:VoiceChunkBuffer[$key] = @{ Chunks = @{}; Total = $TotalChunks; Duration = $Duration; FileName = $FromCode; Received = (Get-Date) }
     }
     $vb = $script:VoiceChunkBuffer[$key]
-    $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+    if ($ChunkIndex -ge 0 -and $ChunkIndex -lt $TotalChunks -and -not $vb.Chunks.ContainsKey($ChunkIndex)) {
+        $vb.Chunks[$ChunkIndex] = [Convert]::FromBase64String($ChunkB64)
+    }
     if ($vb.Chunks.Count -eq $TotalChunks) {
         $allData = New-Object byte[] 0
         for ($i = 0; $i -lt $TotalChunks; $i++) { if ($vb.Chunks.ContainsKey($i)) { $allData = $allData + $vb.Chunks[$i] } }
@@ -1958,7 +1957,7 @@ function Get-PinnedMessages {
 function Add-Reaction {
     param([int]$MsgIndex, [string]$TargetCode, [string]$Emoji)
     $inbox = @(Load-Data $InboxFile)
-    $idx = $MsgIndex - 1
+    $idx = $MsgIndex
     if ($idx -lt 0 -or $idx -ge $inbox.Count) { return }
     $m = $inbox[$idx]
     if ($m.FromCode -ne $TargetCode -and $m.ToCode -ne $TargetCode) { return }
@@ -1983,7 +1982,7 @@ function Get-ReactionDisplay {
 function Forward-Message {
     param([int]$MsgIndex, [string]$TargetCode, [string]$FromCode)
     $inbox = @(Load-Data $InboxFile)
-    $idx = $MsgIndex - 1
+    $idx = $MsgIndex
     if ($idx -lt 0 -or $idx -ge $inbox.Count) { Write-Host "Invalid index." -ForegroundColor Red; return }
     $original = $inbox[$idx]
     $fromInfo = if ($original.FromCode -eq $FromCode) { "me" } else { $original.FromCode }
@@ -2046,7 +2045,11 @@ function Show-Header {
     }
     if ($RegistryAddress) { Write-Host "Directory: $RegistryAddress" -ForegroundColor DarkYellow }
     $onlineCount = 0
-    foreach ($f in $script:Friends) { if (Discover-IP $f.Code) { $onlineCount++ } }
+    foreach ($f in $script:Friends) {
+        $fc = $script:IPCache[$f.Code]
+        if ($fc -is [hashtable] -and $fc.IP) { $onlineCount++ }
+        elseif ($fc -is [string]) { $onlineCount++ }
+    }
     Write-Host "[FS: ECDH-P521 + RSA-2048 signing + AES-256]" -ForegroundColor DarkYellow
     Write-Host "[Friends online: $onlineCount/$($script:Friends.Count) | Voice | Groups | Files | Search]" -ForegroundColor DarkGray
     Write-Host "============================" -ForegroundColor Cyan
@@ -2260,7 +2263,7 @@ function Chat-Session {
             }
             $pIdx = Read-Host "Index to pin/unpin (c to cancel)"
             if ($pIdx -ne "c") {
-                try { $actualIdx = [array]::IndexOf($inboxP, $convoP[[int]$pIdx]); $okP, $resultP = Pin-Message -Index $actualIdx; Write-Host $resultP -ForegroundColor $(if ($okP) { "Green" } else { "Red" }) } catch { Write-Host "Invalid" -ForegroundColor Red }
+                try { $pMsg = $convoP[[int]$pIdx]; $actualIdx = [array]::IndexOf($inboxP, $pMsg); $okP, $resultP = Pin-Message -Index $actualIdx; Write-Host $resultP -ForegroundColor $(if ($okP) { "Green" } else { "Red" }) } catch { Write-Host "Invalid" -ForegroundColor Red }
             }
             continue
         }
@@ -2312,6 +2315,7 @@ function Add-NewFriend {
     Write-Host "`n=== Add Friend ===" -ForegroundColor Cyan
     $name = Read-Host "Enter friend's name"
     $code = Read-Host "Enter friend's code"
+    if ($code -notmatch '^[A-F0-9]{4}-[A-F0-9]{4}$') { Write-Host "Invalid code format (expected XXXX-XXXX)." -ForegroundColor Red; return }
     $exists = $script:Friends | Where-Object { $_.Code -eq $code }
     if ($exists) { Write-Host "Already in friends." -ForegroundColor Yellow; return }
     $friend = [PSCustomObject]@{ Code = $code; Name = $name; Added = (Get-Date -Format "yyyy-MM-dd") }
