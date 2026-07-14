@@ -29,6 +29,10 @@ $DownloadsDir = Join-Path $DataDir "downloads"
 $SentFilesFile = Join-Path $DataDir "sent_files.json"
 $IdentityFile = Join-Path $DataDir "identity.json"
 $StatusFile = Join-Path $DataDir "status.json"
+$MutedFile = Join-Path $DataDir "muted.json"
+$ScheduledFile = Join-Path $DataDir "scheduled.json"
+$AIConfigFile = Join-Path $DataDir "ai_config.json"
+$SelfDestructFile = Join-Path $DataDir "selfdestruct.json"
 
 $script:ReactionEmojis = @(
     [char]::ConvertFromUtf32(0x1F44D); [char]0x2764; [char]::ConvertFromUtf32(0x1F602)
@@ -106,6 +110,8 @@ $script:RateLimitTimes = @()
 $script:PendingFileTransfer = @{}
 $script:ChatKeyCache = @{}
 $script:FileSendQueue = @{}
+$script:EphemeralMode = 0
+$script:DefaultTranslateLang = "en"
 $relayServerJob = $null
 
 function Get-LocalIP {
@@ -782,7 +788,7 @@ function Show-History {
 # ========== TCP LISTENER (background job) ==========
 
 $tcpListenerScript = {
-    param($ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound)
+    param($ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound, $MutedFile)
     $script:MyCode = $MyCode
     $script:ChatPort = $ChatPort
 
@@ -1098,7 +1104,8 @@ $tcpListenerScript = {
                                 $inbox += $msgObj
                                 Save-JData $InboxFile $inbox
                                 if ($displayMsg) {
-                                    if (-not $DisableSound) { [System.Console]::Beep(600, 120) }
+                                    $mutedListL = @(Load-JData $MutedFile)
+                                    if (-not $DisableSound -and ($mutedListL -notcontains $senderCode)) { [System.Console]::Beep(600, 120) }
                                     Write-Host "`n${tag}$senderCode : $displayMsg" -ForegroundColor Cyan
                                     Write-Host -NoNewline "> " -ForegroundColor Green
                                 }
@@ -1333,7 +1340,7 @@ $relayServerScript = {
 }
 
 Write-Host "Starting services..." -ForegroundColor DarkGray
-$tcpJob = Start-Job -Name "TCPListener" -ScriptBlock $tcpListenerScript -ArgumentList $ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound
+$tcpJob = Start-Job -Name "TCPListener" -ScriptBlock $tcpListenerScript -ArgumentList $ChatPort, $InboxFile, $BlockedFile, $PrivateKeyFile, $KnownKeysFile, $MyCode, $ECDHKeyFile, $DownloadsDir, $DisableSound, $MutedFile
 $udpJob = Start-Job -Name "UDPDiscovery" -ScriptBlock $udpListenerScript -ArgumentList $DiscoveryPort, $MyCode, $MyIP, $MyPublicKeyB64
 
 $script:RelayAddr = ""
@@ -1647,7 +1654,7 @@ function Push-RelayMessages {
             $inbox = @(Load-Data $InboxFile)
             $inbox += $msgObj
             Save-Data $InboxFile $inbox
-            if (-not $DisableSound) { [System.Console]::Beep(600, 120) }
+            if (-not $DisableSound -and -not (Is-Muted $senderCode)) { [System.Console]::Beep(600, 120) }
             Write-Host "`n${tag}[Relay] $senderCode : $displayMsg" -ForegroundColor Magenta
             Write-Host -NoNewline "> " -ForegroundColor Green
         }
@@ -2022,6 +2029,249 @@ function Show-MessageStats {
     if ($sorted) { Write-Host "  Top words: $($sorted.Key -join ', ')" }
 }
 
+# ========== AI ASSISTANT ==========
+
+function Get-AIConfig {
+    $data = Load-Data $AIConfigFile
+    if (-not $data -or -not $data.APIKey) { return @{ APIKey = ""; Endpoint = "https://api.openai.com/v1/chat/completions"; Model = "gpt-3.5-turbo" } }
+    return $data
+}
+
+function Save-AIConfig {
+    param($Config)
+    Save-Data $AIConfigFile $Config
+}
+
+function Ask-AI {
+    param([string]$Prompt)
+    $cfg = Get-AIConfig
+    if (-not $cfg.APIKey) { return "AI not configured. Use `/ai key <key>` to set your API key." }
+    try {
+        $body = @{
+            model = $cfg.Model
+            messages = @(
+                @{ role = "system"; content = "You are a helpful assistant in a messaging app. Respond concisely." }
+                @{ role = "user"; content = $Prompt }
+            )
+            max_tokens = 500
+            temperature = 0.7
+        } | ConvertTo-Json -Depth 5
+        $resp = Invoke-RestMethod -Uri $cfg.Endpoint -Method Post -Body $body -ContentType "application/json" -Headers @{ Authorization = "Bearer $($cfg.APIKey)" } -TimeoutSec 30
+        if ($resp.choices -and $resp.choices[0].message) { return $resp.choices[0].message.content.Trim() }
+        return "No response from AI."
+    } catch { return "AI error: $_" }
+}
+
+# ========== SELF-DESTRUCTING MESSAGES ==========
+
+function Add-SelfDestructMessage {
+    param([string]$FromCode, [string]$ToCode, [int]$MsgIndex, [int]$LifetimeSeconds)
+    $sd = @(Load-Data $SelfDestructFile)
+    $sd += [PSCustomObject]@{
+        FromCode = $FromCode; ToCode = $ToCode; MsgIndex = $MsgIndex
+        ExpiresAt = (Get-Date).AddSeconds($LifetimeSeconds).ToString("o")
+        Created = (Get-Date -Format "o")
+    }
+    Save-Data $SelfDestructFile $sd
+}
+
+function Cleanup-SelfDestructMessages {
+    $sd = @(Load-Data $SelfDestructFile)
+    if ($sd.Count -eq 0) { return }
+    $now = Get-Date
+    $expired = @($sd | Where-Object { $_.ExpiresAt -and ([DateTime]$_.ExpiresAt) -le $now })
+    if ($expired.Count -eq 0) { return }
+    $inbox = @(Load-Data $InboxFile)
+    $changed = $false
+    foreach ($e in $expired) {
+        $idx = $e.MsgIndex
+        if ($idx -ge 0 -and $idx -lt $inbox.Count) {
+            $inbox[$idx].Text = "[Self-destructed message]"
+            $inbox[$idx].SelfDestructed = $true
+            $changed = $true
+        }
+    }
+    $sd = @($sd | Where-Object { $_.ExpiresAt -and ([DateTime]$_.ExpiresAt) -gt $now })
+    Save-Data $SelfDestructFile $sd
+    if ($changed) { Save-Data $InboxFile $inbox }
+}
+
+# ========== MESSAGE SCHEDULING ==========
+
+function Schedule-Message {
+    param([string]$TargetCode, [string]$TargetName, [string]$Message, [string]$SendAt)
+    try {
+        $sendTime = [DateTime]::Parse($SendAt)
+        if ($sendTime -le (Get-Date)) { return $false, "Time must be in the future" }
+        $scheduled = @(Load-Data $ScheduledFile)
+        $scheduled += [PSCustomObject]@{
+            ID = [System.Guid]::NewGuid().ToString().Substring(0,8)
+            TargetCode = $TargetCode; TargetName = $TargetName; Message = $Message
+            SendAt = $sendTime.ToString("o"); Created = (Get-Date -Format "o"); Sent = $false
+        }
+        Save-Data $ScheduledFile $scheduled
+        return $true, "Scheduled for $($sendTime.ToString('yyyy-MM-dd HH:mm'))"
+    } catch { return $false, "Invalid time format. Use 'YYYY-MM-DD HH:mm'" }
+}
+
+function Process-ScheduledMessages {
+    $scheduled = @(Load-Data $ScheduledFile)
+    if ($scheduled.Count -eq 0) { return }
+    $now = Get-Date
+    $changed = $false
+    foreach ($s in $scheduled) {
+        if (-not $s.Sent -and $s.SendAt -and ([DateTime]$s.SendAt) -le $now) {
+            $ok, $result = Send-Message -TargetCode $s.TargetCode -Message "[Scheduled] $($s.Message)"
+            $s.Sent = $true; $s.SentAt = (Get-Date -Format "o")
+            $s.Status = if ($ok) { "delivered" } else { "failed" }
+            $changed = $true
+            if ($ok) { Write-Host "`n[SCHEDULED] Msg to $($s.TargetName) sent" -ForegroundColor Cyan }
+            else { Write-Host "`n[SCHEDULED] Failed to send to $($s.TargetName)" -ForegroundColor Red }
+            Write-Host -NoNewline "> " -ForegroundColor Green
+        }
+    }
+    if ($changed) { Save-Data $ScheduledFile $scheduled }
+}
+
+# ========== BROADCAST ==========
+
+function Send-Broadcast {
+    param([string]$Message)
+    if ($script:Friends.Count -eq 0) { return $false, "No friends to broadcast to" }
+    $sent = 0; $failed = 0
+    foreach ($f in $script:Friends) {
+        $ok, $r = Send-Message -TargetCode $f.Code -Message "[Broadcast] $Message"
+        if ($ok) { $sent++ } else { $failed++ }
+        Start-Sleep -Milliseconds 100
+    }
+    return $true, "Broadcast sent to $sent friend(s), $failed failed"
+}
+
+# ========== TRANSLATION ==========
+
+function Translate-Message {
+    param([string]$Text, [string]$TargetLang = $script:DefaultTranslateLang)
+    $cfg = Get-AIConfig
+    if (-not $cfg.APIKey) { return "[Translation requires AI API key. Use `/ai key <key>`]" }
+    try {
+        $body = @{
+            model = $cfg.Model
+            messages = @(
+                @{ role = "system"; content = "Translate the following to $TargetLang. Only respond with the translation, no explanation." }
+                @{ role = "user"; content = $Text }
+            )
+            max_tokens = 500
+        } | ConvertTo-Json -Depth 5
+        $resp = Invoke-RestMethod -Uri $cfg.Endpoint -Method Post -Body $body -ContentType "application/json" -Headers @{ Authorization = "Bearer $($cfg.APIKey)" } -TimeoutSec 15
+        if ($resp.choices -and $resp.choices[0].message) { return $resp.choices[0].message.content.Trim() }
+        return "[Translation failed]"
+    } catch { return "[Translation error: $_]" }
+}
+
+# ========== MUTE PER CONTACT ==========
+
+function Get-MutedList {
+    return @(Load-Data $MutedFile)
+}
+
+function Save-MutedList {
+    param($Data)
+    Save-Data $MutedFile $Data
+}
+
+function Is-Muted {
+    param([string]$Code)
+    $muted = Get-MutedList
+    return $muted -contains $Code
+}
+
+function Toggle-Mute {
+    param([string]$Code)
+    $muted = Get-MutedList
+    if ($muted -contains $Code) {
+        $muted = @($muted | Where-Object { $_ -ne $Code })
+        Save-MutedList $muted
+        return $false, "Unmuted $Code"
+    } else {
+        $muted += $Code
+        Save-MutedList $muted
+        return $true, "Muted $Code"
+    }
+}
+
+# ========== QUOTE REPLY ==========
+
+function Format-QuoteReply {
+    param([int]$MsgIndex, [string]$ReplyText)
+    $inbox = @(Load-Data $InboxFile)
+    if ($MsgIndex -lt 0 -or $MsgIndex -ge $inbox.Count) { return $null, "Invalid message index" }
+    $original = $inbox[$MsgIndex]
+    $quoted = "> $($original.Text)`n`n$ReplyText"
+    return $quoted, $null
+}
+
+# ========== MESSAGE RECALL (Undo Send) ==========
+
+$script:LastSentInfo = @{ Text = ""; TargetCode = ""; Time = [DateTime]::MinValue }
+
+function Send-Recallable {
+    param([string]$TargetCode, [string]$Message)
+    $ok, $result = Send-Message -TargetCode $TargetCode -Message $Message
+    if ($ok) {
+        $script:LastSentInfo = @{ Text = $Message; TargetCode = $TargetCode; Time = Get-Date }
+    }
+    return $ok, $result
+}
+
+function Recall-LastMessage {
+    $info = $script:LastSentInfo
+    if (-not $info.Text) { return $false, "No message to recall" }
+    if ((Get-Date) -gt $info.Time.AddSeconds(30)) { return $false, "Recall window expired (after 30s)" }
+    $inbox = @(Load-Data $InboxFile)
+    for ($i = $inbox.Count - 1; $i -ge 0; $i--) {
+        if ($inbox[$i].IsSent -and $inbox[$i].ToCode -eq $info.TargetCode -and $inbox[$i].Text -eq $info.Text) {
+            $inbox[$i].Text = "[Recalled message]"
+            $inbox[$i].Recalled = $true
+            Save-Data $InboxFile $inbox
+            $script:LastSentInfo = @{ Text = ""; TargetCode = ""; Time = [DateTime]::MinValue }
+            return $true, "Message recalled"
+        }
+    }
+    return $false, "Message not found"
+}
+
+function Show-SlashHelp {
+    Write-Host "--- Slash Commands ---" -ForegroundColor Cyan
+    Write-Host "/ai <prompt>        - Ask AI assistant" -ForegroundColor White
+    Write-Host "/ai key <key>       - Set OpenAI API key" -ForegroundColor White
+    Write-Host "/ai endpoint <url>  - Set custom AI endpoint" -ForegroundColor White
+    Write-Host "/ai model <name>    - Set AI model" -ForegroundColor White
+    Write-Host "/schedule <dt> <m>  - Schedule a message (YYYY-MM-DD HH:mm)" -ForegroundColor White
+    Write-Host "/broadcast <msg>    - Send to all friends" -ForegroundColor White
+    Write-Host "/tl <lang> <text>   - Translate text" -ForegroundColor White
+    Write-Host "/tl set <lang>      - Set default target language" -ForegroundColor White
+    Write-Host "/mute               - Toggle mute for this contact" -ForegroundColor White
+    Write-Host "/recall             - Undo last sent message (within 30s)" -ForegroundColor White
+    Write-Host "/r <idx> <reply>    - Reply quoting a message" -ForegroundColor White
+    Write-Host "/ephemeral          - Toggle self-destruct mode" -ForegroundColor White
+    Write-Host "/e                  - Show emoji list" -ForegroundColor White
+    Write-Host "/s <query>          - Search messages" -ForegroundColor White
+    Write-Host "/help               - Show this help" -ForegroundColor White
+    Write-Host "!s <sec> <msg>      - Send a self-destructing message" -ForegroundColor White
+}
+
+function Toggle-EphemeralMode {
+    param([string]$TargetCode)
+    $secs = Read-Host "Self-destruct after N seconds (0=off)"
+    if ($secs -eq "0" -or $secs -eq "") {
+        $script:EphemeralMode = 0
+        Write-Host "Ephemeral mode OFF" -ForegroundColor Green
+    } else {
+        $script:EphemeralMode = [int]$secs
+        Write-Host "Ephemeral mode ON: messages self-destruct in $($script:EphemeralMode)s" -ForegroundColor Yellow
+    }
+}
+
 function Show-Header {
     Clear-Host
     Write-Host "===== Message App v2.0 =====" -ForegroundColor Cyan
@@ -2050,8 +2300,11 @@ function Show-Header {
         if ($fc -is [hashtable] -and $fc.IP) { $onlineCount++ }
         elseif ($fc -is [string]) { $onlineCount++ }
     }
-    Write-Host "[FS: ECDH-P521 + RSA-2048 signing + AES-256]" -ForegroundColor DarkYellow
-    Write-Host "[Friends online: $onlineCount/$($script:Friends.Count) | Voice | Groups | Files | Search]" -ForegroundColor DarkGray
+    $hasAI = if ((Get-AIConfig).APIKey) { "[AI]" } else { "" }
+    $ephemeralTag2 = if ($script:EphemeralMode -gt 0) { " | EPHEMERAL:$($script:EphemeralMode)s" } else { "" }
+    $mutedCount = @(Get-MutedList).Count
+    Write-Host "[FS: ECDH-P521 + RSA-2048 signing + AES-256] $hasAI" -ForegroundColor DarkYellow
+    Write-Host "[Friends online: $onlineCount/$($script:Friends.Count) | Voice | Groups | Files | Search | AI | Muted:$mutedCount]$ephemeralTag2" -ForegroundColor DarkGray
     Write-Host "============================" -ForegroundColor Cyan
 }
 
@@ -2081,6 +2334,10 @@ function Show-MainMenu {
     Write-Host "19. Export Chat History" -ForegroundColor White
     Write-Host "20. Set Your Status" -ForegroundColor White
     Write-Host "21. Message Stats" -ForegroundColor White
+    Write-Host "22. AI Configuration" -ForegroundColor White
+    Write-Host "23. Mute/Unmute Friend" -ForegroundColor White
+    Write-Host "24. Broadcast Message" -ForegroundColor White
+    Write-Host "25. Scheduled Messages" -ForegroundColor White
     Write-Host "0. Exit" -ForegroundColor Red
 }
 
@@ -2167,7 +2424,9 @@ function Chat-Session {
             Write-Host "[PIN] $pwho : $($pm.Text)" -ForegroundColor DarkYellow
         }
     }
-    Write-Host "'r' refresh, 'h' history, 'f' file, 'v' voice, '/s' search, '/e' emoji, 'p' pin, 'd' delete, 'e' edit, 'back' return" -ForegroundColor DarkGray
+    $ephemeralTag = if ($script:EphemeralMode -gt 0) { " | EPHEMERAL:$($script:EphemeralMode)s" } else { "" }
+    Write-Host "'r' refresh, 'h' history, 'f' file, 'v' voice, '/s' search, '/e' emoji$ephemeralTag" -ForegroundColor DarkGray
+    Write-Host "'/ai' AI, '/schedule', '/broadcast', '/tl' translate, '/mute', '/recall', '/r <idx>' reply, '/help'" -ForegroundColor DarkGray
 
     while ($true) {
         $input = Read-Host "You"
@@ -2272,9 +2531,121 @@ function Chat-Session {
             Write-Host "Shortcodes: $($EmojiMap.Keys -join ' ') use :name:" -ForegroundColor DarkGray
             continue
         }
+        if ($input -eq "/help") { Show-SlashHelp; continue }
+
+        # ---- AI Assistant ----
+        if ($input -match '^/ai (.+)$') {
+            $prompt = $matches[1]
+            if ($prompt -match '^key (.+)$') {
+                $cfg = Get-AIConfig; $cfg.APIKey = $matches[1]; Save-AIConfig $cfg
+                Write-Host "AI API key saved." -ForegroundColor Green
+            } elseif ($prompt -match '^endpoint (.+)$') {
+                $cfg = Get-AIConfig; $cfg.Endpoint = $matches[1]; Save-AIConfig $cfg
+                Write-Host "AI endpoint saved." -ForegroundColor Green
+            } elseif ($prompt -match '^model (.+)$') {
+                $cfg = Get-AIConfig; $cfg.Model = $matches[1]; Save-AIConfig $cfg
+                Write-Host "AI model saved." -ForegroundColor Green
+            } else {
+                Write-Host "AI thinking..." -ForegroundColor Yellow
+                $response = Ask-AI $prompt
+                $ok, $result = Send-Recallable -TargetCode $TargetCode -Message "[AI] $response"
+                Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            }
+            continue
+        }
+
+        # ---- Self-Destruct Inline (!s <sec> <msg>) ----
+        if ($input -match '^!s (\d+) (.+)$') {
+            $sdSecs = [int]$matches[1]; $sdMsg = $matches[2]
+            $sdMsg = Expand-Emoji $sdMsg
+            $ok, $result = Send-Recallable -TargetCode $TargetCode -Message $sdMsg
+            if ($ok) {
+                $inboxSD = @(Load-Data $InboxFile)
+                $lastSDIdx = $inboxSD.Count - 1
+                $inboxSD[$lastSDIdx].Text = "[Self-destruct ${sdSecs}s] $($inboxSD[$lastSDIdx].Text)"
+                $inboxSD[$lastSDIdx].Ephemeral = $sdSecs
+                Save-Data $InboxFile $inboxSD
+                Add-SelfDestructMessage -FromCode $MyCode -ToCode $TargetCode -MsgIndex $lastSDIdx -LifetimeSeconds $sdSecs
+                Write-Host "Message will self-destruct in ${sdSecs}s" -ForegroundColor Yellow
+            }
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+
+        # ---- Schedule ----
+        if ($input -match '^/schedule (.+?) (.+)$') {
+            $timeP = $matches[1]; $msgP = $matches[2]
+            $ok, $result = Schedule-Message -TargetCode $TargetCode -TargetName $displayName -Message $msgP -SendAt $timeP
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+
+        # ---- Broadcast ----
+        if ($input -match '^/broadcast (.+)$') {
+            $ok, $result = Send-Broadcast -Message $matches[1]
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+
+        # ---- Translate ----
+        if ($input -match '^/tl set (.+)$') {
+            $script:DefaultTranslateLang = $matches[1]
+            Write-Host "Default translation language set to: $($script:DefaultTranslateLang)" -ForegroundColor Green
+            continue
+        }
+        if ($input -match '^/tl (.+?) (.+)$') {
+            Write-Host "Translating..." -ForegroundColor Yellow
+            $translated = Translate-Message -Text $matches[2] -TargetLang $matches[1]
+            Write-Host "Translation: $translated" -ForegroundColor Cyan
+            continue
+        }
+
+        # ---- Mute ----
+        if ($input -eq '/mute') {
+            $muted, $result = Toggle-Mute -Code $TargetCode
+            Write-Host $result -ForegroundColor $(if ($muted) { "Yellow" } else { "Green" })
+            continue
+        }
+
+        # ---- Recall (Undo) ----
+        if ($input -eq '/recall') {
+            $ok, $result = Recall-LastMessage
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+
+        # ---- Ephemeral Mode ----
+        if ($input -eq '/ephemeral') {
+            Toggle-EphemeralMode -TargetCode $TargetCode
+            continue
+        }
+
+        # ---- Quote Reply ----
+        if ($input -match '^/r (\d+) (.+)$') {
+            $rIdx = [int]$matches[1]; $rText = $matches[2]
+            $quoted, $err = Format-QuoteReply -MsgIndex $rIdx -ReplyText $rText
+            if ($err) { Write-Host $err -ForegroundColor Red; continue }
+            $input = Expand-Emoji $quoted
+            $ok, $result = Send-Recallable -TargetCode $TargetCode -Message $input
+            Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+            continue
+        }
+
         if ($input -eq "") { continue }
         $input = Expand-Emoji $input
-        $ok, $result = Send-Message -TargetCode $TargetCode -Message $input
+        $ok, $result = Send-Recallable -TargetCode $TargetCode -Message $input
+
+        # ---- Self-destruct if ephemeral mode on ----
+        if ($script:EphemeralMode -gt 0 -and $ok) {
+            $inboxSD = @(Load-Data $InboxFile)
+            $lastSDIdx = $inboxSD.Count - 1
+            $inboxSD[$lastSDIdx].Text = "[Ephemeral $($script:EphemeralMode)s] $($inboxSD[$lastSDIdx].Text)"
+            $inboxSD[$lastSDIdx].Ephemeral = $script:EphemeralMode
+            Save-Data $InboxFile $inboxSD
+            Add-SelfDestructMessage -FromCode $MyCode -ToCode $TargetCode -MsgIndex $lastSDIdx -LifetimeSeconds $script:EphemeralMode
+            Write-Host "Message will self-destruct in $($script:EphemeralMode)s" -ForegroundColor Yellow
+        }
+
         if ($ok) {
             Write-Host $result -ForegroundColor Green
             $hasFSKey = [bool](Get-ECDHKeyForCode $TargetCode)
@@ -2304,7 +2675,8 @@ function Show-FriendsList {
         else { $keyStatus = "[no key]" }
         $status = Get-FriendStatus $f.Code
         $statusColor = if ($status -eq "Online") { "Green" } elseif ($status -eq "Relay") { "Yellow" } else { "DarkGray" }
-        Write-Host "[$i] $($f.Name)  |  $($f.Code)  $keyStatus  " -NoNewline -ForegroundColor White
+        $muteTag = if (Is-Muted $f.Code) { "[MUTED] " } else { "" }
+        Write-Host "[$i] ${muteTag}$($f.Name)  |  $($f.Code)  $keyStatus  " -NoNewline -ForegroundColor White
         Write-Host "($status)" -ForegroundColor $statusColor
         $pinned = Get-PinnedMessages -TargetCode $f.Code
         if ($pinned.Count -gt 0) { Write-Host "      Pin: $($pinned[0].Text)" -ForegroundColor DarkYellow }
@@ -2535,6 +2907,8 @@ try {
     $lastRelayPoll = [DateTime]::MinValue
     $lastNewMsgCheck = [DateTime]::MinValue
     $lastTransferCleanup = [DateTime]::MinValue
+    $lastSelfDestructCleanup = [DateTime]::MinValue
+    $lastScheduleCheck = [DateTime]::MinValue
     $script:HasNewMessages = $false
     while ($true) {
         if ($script:RelayAddr -and ([DateTime]::Now - $lastRelayPoll).TotalSeconds -ge 3) {
@@ -2551,6 +2925,16 @@ try {
         if (([DateTime]::Now - $lastTransferCleanup).TotalSeconds -ge 60) {
             Cleanup-StaleTransfers
             $lastTransferCleanup = [DateTime]::Now
+        }
+
+        if (([DateTime]::Now - $lastSelfDestructCleanup).TotalSeconds -ge 5) {
+            Cleanup-SelfDestructMessages
+            $lastSelfDestructCleanup = [DateTime]::Now
+        }
+
+        if (([DateTime]::Now - $lastScheduleCheck).TotalSeconds -ge 15) {
+            Process-ScheduledMessages
+            $lastScheduleCheck = [DateTime]::Now
         }
 
         Show-Header
@@ -2681,6 +3065,55 @@ try {
             }
             "21" {
                 Show-MessageStats
+                Read-Host "`nPress Enter"
+            }
+            "22" {
+                $cfg = Get-AIConfig
+                Write-Host "`n--- AI Configuration ---" -ForegroundColor Cyan
+                Write-Host "Endpoint: $($cfg.Endpoint)" -ForegroundColor White
+                Write-Host "Model: $($cfg.Model)" -ForegroundColor White
+                Write-Host "API Key: $(if ($cfg.APIKey) { '****' + $cfg.APIKey.Substring([Math]::Max(0,$cfg.APIKey.Length-4)) } else { 'Not set' })" -ForegroundColor White
+                Write-Host "1. Set API Key" -ForegroundColor White
+                Write-Host "2. Set Endpoint" -ForegroundColor White
+                Write-Host "3. Set Model" -ForegroundColor White
+                $ac = Read-Host "Choice"
+                if ($ac -eq "1") { $k = Read-Host "API Key (enter)"; $cfg.APIKey = $k; Save-AIConfig $cfg; Write-Host "Saved!" -ForegroundColor Green }
+                elseif ($ac -eq "2") { $e = Read-Host "Endpoint URL (enter)"; $cfg.Endpoint = $e; Save-AIConfig $cfg; Write-Host "Saved!" -ForegroundColor Green }
+                elseif ($ac -eq "3") { $m = Read-Host "Model name (enter)"; $cfg.Model = $m; Save-AIConfig $cfg; Write-Host "Saved!" -ForegroundColor Green }
+                Read-Host "`nPress Enter"
+            }
+            "23" {
+                if ($script:Friends.Count -eq 0) { Write-Host "No friends." -ForegroundColor Yellow; Read-Host "Press Enter"; continue }
+                Show-FriendsList
+                $fIdx = Read-Host "`nToggle mute for friend number (c to cancel)"
+                if ($fIdx -eq "c") { continue }
+                try {
+                    $f = $script:Friends[[int]$fIdx]
+                    $muted, $result = Toggle-Mute -Code $f.Code
+                    Write-Host $result -ForegroundColor $(if ($muted) { "Yellow" } else { "Green" })
+                } catch { Write-Host "Invalid." -ForegroundColor Red }
+                Read-Host "`nPress Enter"
+            }
+            "24" {
+                $bMsg = Read-Host "Broadcast message to all friends"
+                if ($bMsg) {
+                    $ok, $result = Send-Broadcast -Message $bMsg
+                    Write-Host $result -ForegroundColor $(if ($ok) { "Green" } else { "Red" })
+                }
+                Read-Host "`nPress Enter"
+            }
+            "25" {
+                $scheduled = @(Load-Data $ScheduledFile)
+                Write-Host "`n--- Scheduled Messages ---" -ForegroundColor Cyan
+                if ($scheduled.Count -eq 0) { Write-Host "No scheduled messages." -ForegroundColor Yellow }
+                else {
+                    foreach ($s in $scheduled) {
+                        $status = if ($s.Sent) { "Sent at $($s.SentAt)" } else { "Pending: $($s.SendAt)" }
+                        Write-Host "[$($s.ID)] To: $($s.TargetName) | $status" -ForegroundColor White
+                        Write-Host "     Msg: $($s.Message)" -ForegroundColor DarkGray
+                    }
+                }
+                Write-Host "To schedule from chat: /schedule <YYYY-MM-DD HH:mm> <message>" -ForegroundColor DarkGray
                 Read-Host "`nPress Enter"
             }
             "0" { break }

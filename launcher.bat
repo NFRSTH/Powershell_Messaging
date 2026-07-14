@@ -16,9 +16,11 @@ echo [5] Connect to Directory
 echo [6] View Your Code
 echo [7] Help / Info
 echo.
-echo Features: FS ECDH-P521 + RSA Signing + AES-256
+echo Features: AI Assistant + Self-Destruct + Scheduling
+echo FS ECDH-P521 + RSA Signing + AES-256
+echo Broadcast + Translation + Mute + Recall + Quote Reply
 echo Delivery Receipts + Typing + Chat Export + Persistent ID
-echo Rate Limit (10/s), File Sharing, Groups, Search
+echo Rate Limit (10/s), File Sharing, Groups, Search, Voice Notes
 echo.
 set /p choice="Select option (1-7): "
 
@@ -125,7 +127,44 @@ echo To chat locally: Just run the app
 echo To chat online: One person runs relay server
 echo Others connect with -RelayAddress
 echo.
-echo === New Features in v2.1 ===
+echo === NEW FEATURES in v3.0 ===
+echo.
+echo AI Assistant (BIG differentiator):
+echo   - Use /ai ^<prompt^> in any chat to ask AI (OpenAI-compatible)
+echo   - /ai key ^<key^> to set your API key
+echo   - /ai endpoint ^<url^> for custom endpoints
+echo   - /ai model ^<name^> to select model
+echo   - Neither WhatsApp nor Discord has built-in AI chat!
+echo.
+echo Self-Destructing Messages:
+echo   - !s ^<sec^> ^<msg^> for one-off self-destruct
+echo   - /ephemeral to toggle timed auto-delete mode
+echo   - Messages vanish after expiry like Snapchat
+echo.
+echo Message Scheduling:
+echo   - /schedule ^<YYYY-MM-DD HH:mm^> ^<msg^> to send later
+echo   - Perfect for reminders and birthday messages
+echo.
+echo Broadcast:
+echo   - /broadcast ^<msg^> sends to ALL friends at once
+echo   - Like Telegram broadcast channels
+echo.
+echo Message Translation:
+echo   - /tl ^<lang^> ^<text^> instant AI translation
+echo   - /tl set ^<lang^> to set default language
+echo.
+echo Quote Reply:
+echo   - /r ^<idx^> ^<reply^> reply with quoted context
+echo.
+echo Message Recall:
+echo   - /recall undoes your last sent message (within 30s)
+echo.
+echo Per-Contact Mute:
+echo   - /mute silences notifications from a contact
+echo   - [MUTED] badge in friends list
+echo   - Menu option 23 to manage
+echo.
+echo === Legacy Features ===
 echo.
 echo Forward Secrecy (FS):
 echo   - ECDH-P521 ephemeral key exchange per message
